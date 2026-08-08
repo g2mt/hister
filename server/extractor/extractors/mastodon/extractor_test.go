@@ -5,9 +5,21 @@ package mastodon
 import (
 	"testing"
 
+	"github.com/asciimoo/hister/config"
 	"github.com/asciimoo/hister/server/document"
 	"github.com/asciimoo/hister/server/types"
 )
+
+func TestSetConfigRejectsUnknownOptions(t *testing.T) {
+	e := &MastodonExtractor{}
+	err := e.SetConfig(&config.Extractor{
+		Enable:  true,
+		Options: map[string]any{"unknown": true},
+	})
+	if err == nil {
+		t.Fatal("SetConfig accepted an unknown option")
+	}
+}
 
 func TestOriginalStatusURL(t *testing.T) {
 	tests := []struct {
@@ -68,5 +80,26 @@ func TestExtractUsesOriginalRemoteStatusURL(t *testing.T) {
 	}
 	if got, want := d.ExtraDocuments[0].URL, "https://infosec.exchange/@hovav/116976714107843531"; got != want {
 		t.Fatalf("toot URL = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSkipsDocumentWhenNoTootsFound(t *testing.T) {
+	d := &document.Document{
+		URL:  "https://chaos.social/public/local",
+		HTML: `<meta content='{"repository":"mastodon/mastodon"}'>`,
+	}
+
+	state, err := (&MastodonExtractor{}).Extract(d)
+	if err != nil {
+		t.Fatalf("Extract returned an error: %v", err)
+	}
+	if state != types.ExtractorStop {
+		t.Fatalf("Extract state = %v, want %v", state, types.ExtractorStop)
+	}
+	if !d.SkipIndexing {
+		t.Fatal("source document was not marked to skip indexing")
+	}
+	if len(d.ExtraDocuments) != 0 {
+		t.Fatalf("ExtraDocuments length = %d, want 0", len(d.ExtraDocuments))
 	}
 }

@@ -32,6 +32,43 @@ func TestServerDefaults(t *testing.T) {
 	if cfg.Server.BaseURL != DefaultServerBaseURL {
 		t.Fatalf("default server base_url=%q, want %q", cfg.Server.BaseURL, DefaultServerBaseURL)
 	}
+	if cfg.Server.MaxBatchBodySize != DefaultMaxBatchBodySize {
+		t.Fatalf("default server max_batch_body_size=%d, want %d", cfg.Server.MaxBatchBodySize, DefaultMaxBatchBodySize)
+	}
+	if cfg.Server.MaxBatchBodyBytes() != 40<<20 {
+		t.Fatalf("default server batch body bytes=%d, want %d", cfg.Server.MaxBatchBodyBytes(), 40<<20)
+	}
+}
+
+func TestServerMaxBatchBodySizeConfig(t *testing.T) {
+	cfg, err := parseConfig([]byte("server:\n  max_batch_body_size: 12\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.MaxBatchBodyBytes() != 12<<20 {
+		t.Fatalf("server batch body bytes=%d, want %d", cfg.Server.MaxBatchBodyBytes(), 12<<20)
+	}
+
+	if _, err := parseConfig([]byte("server:\n  max_batch_body_size: 0\n")); err == nil {
+		t.Fatal("zero server.max_batch_body_size was accepted")
+	}
+}
+
+func TestServerMaxBatchBodySizeEnvironmentOverride(t *testing.T) {
+	const envName = "HISTER__SERVER__MAX_BATCH_BODY_SIZE"
+	oldValue, existed := os.LookupEnv(envName)
+	t.Cleanup(func() { restoreEnv(envName, oldValue, existed) })
+	if err := os.Setenv(envName, "24"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := parseConfig([]byte("server:\n  max_batch_body_size: 12\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.MaxBatchBodySize != 24 {
+		t.Fatalf("server.max_batch_body_size=%d, want environment value 24", cfg.Server.MaxBatchBodySize)
+	}
 }
 
 func TestIndexerDefaults(t *testing.T) {
@@ -49,6 +86,19 @@ func TestIndexerDefaults(t *testing.T) {
 	}
 	if !cfg.Indexer.KeepStopwords {
 		t.Fatal("configured indexer.keep_stopwords=false, want true")
+	}
+}
+
+func TestDirectoryLabelConfig(t *testing.T) {
+	cfg, err := parseConfig([]byte("indexer:\n  directories:\n    - path: /srv/docs\n      label: reference\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Indexer.Directories) != 1 {
+		t.Fatalf("directory count=%d, want 1", len(cfg.Indexer.Directories))
+	}
+	if got := cfg.Indexer.Directories[0].Label; got != "reference" {
+		t.Fatalf("directory label=%q, want %q", got, "reference")
 	}
 }
 
@@ -116,6 +166,28 @@ func TestAppTitleDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.App.Subtitle != "Internal search" {
 		t.Fatalf("app subtitle=%q, want %q", cfg.App.Subtitle, "Internal search")
+	}
+}
+
+func TestAppColorScheme(t *testing.T) {
+	if got := CreateDefaultConfig().App.ColorScheme; got != "automatic" {
+		t.Fatalf("default app color_scheme=%q, want %q", got, "automatic")
+	}
+
+	for _, scheme := range []string{"automatic", "dark", "light"} {
+		t.Run(scheme, func(t *testing.T) {
+			cfg, err := parseConfig([]byte("app:\n  color_scheme: " + scheme + "\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.App.ColorScheme != scheme {
+				t.Fatalf("app color_scheme=%q, want %q", cfg.App.ColorScheme, scheme)
+			}
+		})
+	}
+
+	if _, err := parseConfig([]byte("app:\n  color_scheme: sepia\n")); err == nil {
+		t.Fatal("invalid app.color_scheme was accepted")
 	}
 }
 

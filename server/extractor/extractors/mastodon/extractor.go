@@ -40,6 +40,9 @@ func (e *MastodonExtractor) GetConfig() *config.Extractor {
 }
 
 func (e *MastodonExtractor) SetConfig(c *config.Extractor) error {
+	for k := range c.Options {
+		return fmt.Errorf("unknown option %q", k)
+	}
 	e.cfg = c
 	return nil
 }
@@ -63,13 +66,17 @@ func (e *MastodonExtractor) Extract(d *document.Document) (types.ExtractorState,
 	if err != nil {
 		return types.ExtractorContinue, nil
 	}
+	statuses := doc.Find(".status")
+	if statuses.Length() == 0 {
+		return types.ExtractorStop, nil
+	}
 
 	pu, err := url.Parse(d.URL)
 	if err != nil {
 		return types.ExtractorContinue, nil
 	}
 
-	doc.Find(".status").Each(func(_ int, s *goquery.Selection) {
+	statuses.Each(func(_ int, s *goquery.Selection) {
 		c := s.Find(".status__content")
 		urlutil.RewriteURLs(c, pu)
 		u, exists := s.Find(".status__relative-time").Attr("href")

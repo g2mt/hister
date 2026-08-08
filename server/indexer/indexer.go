@@ -21,6 +21,7 @@ import (
 	"github.com/asciimoo/hister/server/document"
 	"github.com/asciimoo/hister/server/extractor"
 	"github.com/asciimoo/hister/server/indexer/querybuilder"
+	"github.com/asciimoo/hister/server/indexer/searchschema"
 	"github.com/asciimoo/hister/server/model"
 	"github.com/asciimoo/hister/server/types"
 	"github.com/asciimoo/hister/server/vectorstore"
@@ -58,6 +59,7 @@ type indexer struct {
 	embeddingWorkers  int
 	disablePreviews   bool
 	keepStopwords     bool
+	directories       []*config.Directory
 }
 
 const (
@@ -81,9 +83,7 @@ type Query struct {
 	IncludeHTML       bool    `json:"include_html"`
 	IncludeText       bool    `json:"include_text"`
 	Facets            bool    `json:"facets,omitempty"`
-	// FacetSizes overrides the default top-N cap per named facet.
-	// Key is the facet name (e.g. "domains", "languages"); zero/missing
-	// values fall back to defaultFacetTermSize.
+	// FacetSizes overrides the schema default cap per named facet.
 	FacetSizes map[string]int `json:"facet_sizes,omitempty"`
 	// FacetsOnly skips document fetching (size=0) and returns only facet
 	// counts. Requires Facets=true. Used by the /api/facets endpoint.
@@ -97,8 +97,6 @@ type Query struct {
 	PriorityPatterns []string `json:"priority_patterns,omitempty"`
 	cfg              *config.Config
 }
-
-const defaultFacetTermSize = 10
 
 // TermCount and RangeCount are the shape of facet buckets returned by Search
 // when Query.Facets is true.
@@ -128,62 +126,42 @@ type FacetsResult struct {
 	DateHistogram []RangeCount         `json:"date_histogram,omitempty"`
 }
 
-// dateFacetBuckets drives the "updated" histogram. Each entry is a non-
-// overlapping slice of time ending at the previous bucket's boundary; the
-// final "older" bucket is appended implicitly. Order matters, the loop
-// walks most-recent -> oldest so each range's upper bound is the prior
-// range's lower bound.
-var dateFacetBuckets = []struct {
-	name string
-	age  time.Duration
-}{
-	{"last_24h", 24 * time.Hour},
-	{"last_7d", 7 * 24 * time.Hour},
-	{"last_30d", 30 * 24 * time.Hour},
-	{"last_year", 365 * 24 * time.Hour},
-}
-
-var visitCountFacetBuckets = []struct {
-	name  string
-	label string
-	min   *float64
-	max   *float64
-}{
-	{"1", "1 visit", new(float64(1)), new(float64(2))},
-	{"2..4", "2 to 4", new(float64(2)), new(float64(5))},
-	{"5..9", "5 to 9", new(float64(5)), new(float64(10))},
-	{"10..", "10 or more", new(float64(10)), nil},
-}
-
 func addFacets(req *bleve.SearchRequest, sizes map[string]int) {
-	facetSize := func(name string) int {
-		if n := sizes[name]; n > 0 {
+	facetSize := func(definition searchschema.FacetDefinition) int {
+		if n := sizes[definition.Name]; n > 0 {
 			return n
 		}
-		return defaultFacetTermSize
+		return definition.DefaultSize
 	}
-	req.AddFacet("domains", bleve.NewFacetRequest("domain", facetSize("domains")))
-	req.AddFacet("languages", bleve.NewFacetRequest("language", facetSize("languages")))
-	tf := bleve.NewFacetRequest("type", 2)
-	web, local, afterLocal := float64(types.Web), float64(types.Local), float64(types.Local)+1
-	tf.AddNumericRange(types.Web.String(), &web, &local)
-	tf.AddNumericRange(types.Local.String(), &local, &afterLocal)
-	req.AddFacet("types", tf)
-	vf := bleve.NewFacetRequest("add_count", len(visitCountFacetBuckets))
-	for _, b := range visitCountFacetBuckets {
-		vf.AddNumericRange(b.name, b.min, b.max)
+	for _, definition := range searchschema.Facets() {
+		field, ok := searchschema.Field(definition.QueryField)
+		if !ok {
+			continue
+		}
+		switch definition.Kind {
+		case searchschema.FacetKindTerms:
+			req.AddFacet(definition.Name, bleve.NewFacetRequest(field.IndexField, facetSize(definition)))
+		case searchschema.FacetKindNumericRanges:
+			values := searchschema.Values(field.ValueSet)
+			facet := bleve.NewFacetRequest(field.IndexField, len(values))
+			for _, value := range values {
+				facet.AddNumericRange(value.BucketName(), value.Min, value.Max)
+			}
+			req.AddFacet(definition.Name, facet)
+		case searchschema.FacetKindDateRanges:
+			values := searchschema.Values(field.ValueSet)
+			facet := bleve.NewFacetRequest(field.IndexField, len(values))
+			now := time.Now()
+			for _, value := range values {
+				min, max, ok := value.RelativeTimeBounds(now)
+				if !ok {
+					continue
+				}
+				facet.AddNumericRange(value.BucketName(), min, max)
+			}
+			req.AddFacet(definition.Name, facet)
+		}
 	}
-	req.AddFacet("visits", vf)
-	now := time.Now()
-	dh := bleve.NewFacetRequest("updated", len(dateFacetBuckets)+1)
-	var prev *float64
-	for _, b := range dateFacetBuckets {
-		ts := float64(now.Add(-b.age).Unix())
-		dh.AddNumericRange(b.name, &ts, prev)
-		prev = &ts
-	}
-	dh.AddNumericRange("older", nil, prev)
-	req.AddFacet("updated", dh)
 }
 
 func extractTermFacet(f *search.FacetResult) TermFacet {
@@ -198,43 +176,34 @@ func extractTermFacet(f *search.FacetResult) TermFacet {
 	return TermFacet{Terms: out, Other: f.Other}
 }
 
-func visitCountFacetLabel(name string) string {
-	for _, b := range visitCountFacetBuckets {
-		if b.name == name {
-			return b.label
-		}
-	}
-	return ""
-}
-
 func extractFacets(facets search.FacetResults) *FacetsResult {
 	fr := &FacetsResult{Terms: make(map[string]TermFacet)}
-	for _, name := range []string{"domains", "languages"} {
-		if f := facets[name]; f != nil {
-			fr.Terms[name] = extractTermFacet(f)
+	for _, definition := range searchschema.Facets() {
+		facet := facets[definition.Name]
+		if facet == nil {
+			continue
 		}
-	}
-	if f := facets["types"]; f != nil {
-		terms := make([]TermCount, 0, len(f.NumericRanges))
-		for _, nr := range f.NumericRanges {
-			terms = append(terms, TermCount{Term: nr.Name, Count: nr.Count})
-		}
-		fr.Terms["types"] = TermFacet{Terms: terms}
-	}
-	if f := facets["visits"]; f != nil {
-		terms := make([]TermCount, 0, len(f.NumericRanges))
-		for _, nr := range f.NumericRanges {
-			terms = append(terms, TermCount{
-				Term:  nr.Name,
-				Count: nr.Count,
-				Label: visitCountFacetLabel(nr.Name),
-			})
-		}
-		fr.Terms["visits"] = TermFacet{Terms: terms}
-	}
-	if f := facets["updated"]; f != nil {
-		for _, nr := range f.NumericRanges {
-			fr.DateHistogram = append(fr.DateHistogram, RangeCount{Name: nr.Name, Count: nr.Count})
+		switch definition.Kind {
+		case searchschema.FacetKindTerms:
+			fr.Terms[definition.Name] = extractTermFacet(facet)
+		case searchschema.FacetKindNumericRanges:
+			terms := make([]TermCount, 0, len(facet.NumericRanges))
+			for _, numericRange := range facet.NumericRanges {
+				value, _ := searchschema.FacetValue(definition.Name, numericRange.Name)
+				terms = append(terms, TermCount{
+					Term:  numericRange.Name,
+					Count: numericRange.Count,
+					Label: value.Label,
+				})
+			}
+			fr.Terms[definition.Name] = TermFacet{Terms: terms}
+		case searchschema.FacetKindDateRanges:
+			for _, numericRange := range facet.NumericRanges {
+				fr.DateHistogram = append(fr.DateHistogram, RangeCount{
+					Name:  numericRange.Name,
+					Count: numericRange.Count,
+				})
+			}
 		}
 	}
 	return fr
@@ -295,9 +264,10 @@ type MultiBatch struct {
 var (
 	i *indexer
 	// allFields      []string       = []string{"url", "title", "text", "favicon", "html", "domain", "added", "updated", "type", "user_id"}
-	allFields      []string       = []string{"*"}
-	ErrEmptyFilter                = errors.New("delete query must not be empty")
-	bleveConfig    map[string]any = map[string]any{
+	allFields            []string       = []string{"*"}
+	ErrEmptyFilter                      = errors.New("delete query must not be empty")
+	ErrFileURLNotAllowed                = errors.New("file URL is not allowed")
+	bleveConfig          map[string]any = map[string]any{
 		"bolt_timeout": "2s",
 		// https://github.com/blevesearch/bleve/blob/master/docs/persister.md
 		"scorchPersisterOptions": map[string]any{
@@ -329,6 +299,7 @@ func Init(cfg *config.Config) error {
 		return err
 	}
 	i.disablePreviews = cfg.App.DisablePreviews
+	i.directories = cfg.Indexer.Directories
 	if cfg.SemanticSearch.Enable {
 		vs, err := vectorstore.New(cfg)
 		if err != nil {
@@ -576,6 +547,7 @@ func Reindex(basePath string, rules *config.Rules, skipSensitiveChecks bool, det
 	if err != nil {
 		return err
 	}
+	tmpIdx.directories = dirs
 	// Propagate the disablePreviews flag so the temp indexer skips HTML storage too.
 	tmpIdx.disablePreviews = idx.disablePreviews
 	// The data store is shared between the live and temp indexers so that
@@ -649,9 +621,13 @@ func Reindex(basePath string, rules *config.Rules, skipSensitiveChecks bool, det
 							log.Warn().Str("URL", d.URL).Msg("Skipping document, file not found")
 							continue
 						}
-						if files.FindMatchingDir(dirs, pu.Path) == nil {
+						dir := files.FindMatchingDir(dirs, pu.Path)
+						if dir == nil {
 							log.Warn().Str("URL", d.URL).Msg("Skipping document, directory no longer configured")
 							continue
+						}
+						if dir.Label != "" {
+							d.Label = dir.Label
 						}
 					}
 				}
@@ -731,6 +707,7 @@ func Reindex(basePath string, rules *config.Rules, skipSensitiveChecks bool, det
 	}
 	// Restore settings that are not part of the index state.
 	i.disablePreviews = idx.disablePreviews
+	i.directories = dirs
 	// Restore the vector store and embedder on the newly initialized global indexer.
 	if vs != nil && embedder != nil {
 		i.vectorStore = vs
@@ -877,7 +854,37 @@ func embedDocumentChunks(ctx context.Context, idx *indexer, d *document.Document
 }
 
 func Add(d *document.Document) error {
+	if err := i.validateFileDocument(d); err != nil {
+		return err
+	}
 	return i.AddDocument(d)
+}
+
+func (i *indexer) validateFileDocument(d *document.Document) error {
+	pu, err := url.Parse(d.URL)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(pu.Scheme, "file") {
+		return nil
+	}
+	if d.Text == "" {
+		return fmt.Errorf("%w: submitted content is required", ErrFileURLNotAllowed)
+	}
+
+	filePath := filepath.Clean(files.FileURLToPath(d.URL))
+	dir := files.FindMatchingDir(i.directories, filePath)
+	if !filepath.IsAbs(filePath) || dir == nil || !dir.IsMatching(filePath) {
+		return ErrFileURLNotAllowed
+	}
+	ownerID, err := files.FindDirUser(i.directories, filePath)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrFileURLNotAllowed, err)
+	}
+	if ownerID != d.UserID {
+		return fmt.Errorf("%w: directory owner mismatch", ErrFileURLNotAllowed)
+	}
+	return nil
 }
 
 func (i *indexer) Total() uint64 {
@@ -1134,94 +1141,6 @@ func Save(d *document.Document) error {
 	return i.save(d)
 }
 
-func GetLatestDocuments(limit int, latest string, userID uint) *Results {
-	return GetLatestDocumentsFiltered(limit, latest, userID, "")
-}
-
-func GetLatestDocumentsFiltered(limit int, latest string, userID uint, filter string) *Results {
-	if i == nil {
-		return nil
-	}
-	var q query.Query
-	if userID > 0 {
-		uid := float64(userID)
-		userQuery := bleve.NewNumericRangeInclusiveQuery(&uid, &uid, new(true), new(true))
-		userQuery.SetField("user_id")
-		zeroF := float64(0)
-		globalQuery := bleve.NewNumericRangeInclusiveQuery(&zeroF, &zeroF, new(true), new(true))
-		globalQuery.SetField("user_id")
-		q = bleve.NewDisjunctionQuery(userQuery, globalQuery)
-	} else {
-		q = query.NewMatchAllQuery()
-	}
-	if filter = strings.TrimSpace(filter); filter != "" {
-		pattern := "(?i).*" + regexp.QuoteMeta(filter) + ".*"
-		urlQuery := bleve.NewRegexpQuery(pattern)
-		urlQuery.SetField("url")
-		titlePhraseQuery := bleve.NewMatchPhraseQuery(filter)
-		titlePhraseQuery.SetField("title")
-		filterQueries := []query.Query{urlQuery, titlePhraseQuery}
-		if !strings.ContainsAny(filter, " \t\r\n") {
-			titleRegexpQuery := bleve.NewRegexpQuery(pattern)
-			titleRegexpQuery.SetField("title")
-			filterQueries = append(filterQueries, titleRegexpQuery)
-		}
-		q = bleve.NewConjunctionQuery(q, bleve.NewDisjunctionQuery(filterQueries...))
-	}
-	req := bleve.NewSearchRequest(q)
-	req.Fields = []string{"url", "title", "added", "updated", "add_count", "favicon_key", "favicon"}
-	req.Size = limit
-	req.SortByCustom(search.SortOrder{
-		&search.SortField{
-			Field: "updated",
-			Desc:  true,
-		},
-	})
-	if latest != "" {
-		var after []string
-		if err := json.Unmarshal([]byte(latest), &after); err == nil {
-			req.SetSearchAfter(after)
-		}
-	}
-	res, err := i.idx.Search(req)
-	if err != nil || len(res.Hits) < 1 {
-		return nil
-	}
-	docs := make([]*document.Document, len(res.Hits))
-	for i, h := range res.Hits {
-		d := &document.Document{
-			Title: h.Fields["title"].(string),
-			URL:   h.Fields["url"].(string),
-		}
-		if n, ok := h.Fields["added"].(float64); ok {
-			d.Added = int64(n)
-		}
-		if n, ok := h.Fields["updated"].(float64); ok {
-			d.Updated = int64(n)
-		} else {
-			d.Updated = d.Added
-		}
-		if n, ok := h.Fields["add_count"].(float64); ok {
-			d.AddCount = uint(n)
-		}
-		if s, ok := h.Fields["favicon_key"].(string); ok {
-			d.FaviconKey = s
-		} else if s, ok := h.Fields["favicon"].(string); ok {
-			// backward compat: old documents still have favicon inline in Bleve
-			d.Favicon = s
-		}
-		if d.AddCount < 1 {
-			d.AddCount = 1
-		}
-		docs[i] = d
-	}
-	r := &Results{Documents: docs}
-	if pk, err := json.Marshal(res.Hits[len(res.Hits)-1].Sort); err == nil {
-		r.PageKey = string(pk)
-	}
-	return r
-}
-
 func (i *indexer) getOrCreate(lang string) bleve.Index {
 	idxName := indexNameForLanguage(lang)
 	if idxName == defaultIndexerName {
@@ -1308,6 +1227,9 @@ func (b *MultiBatch) getOrCreateBatch(name string, idx bleve.Index) *bleve.Batch
 }
 
 func (b *MultiBatch) Add(d *document.Document) error {
+	if err := b.indexer.validateFileDocument(d); err != nil {
+		return err
+	}
 	return b.add(d, b.incrementAddCount)
 }
 
@@ -1502,7 +1424,11 @@ func DeleteByQuery(text string, userID *uint, onDelete func(url string, userID u
 
 func Search(cfg *config.Config, q *Query) (*Results, error) {
 	q.cfg = cfg
-	req := bleve.NewSearchRequest(q.create())
+	expression := querybuilder.ParseSearch(q.Text)
+	if expression.HasSort {
+		q.Sort = expression.Sort
+	}
+	req := bleve.NewSearchRequest(q.create(expression.Text))
 	req.Fields = allFields
 
 	if q.FacetsOnly {
@@ -1524,20 +1450,11 @@ func Search(cfg *config.Config, q *Query) (*Results, error) {
 		req.Highlight = bleve.NewHighlightWithStyle("tui")
 	}
 
-	sortByScore := false
 	// TODO / question: should we store the length of the URL path and sort by it,
 	// prefering shorter path names for tied score?
-	switch q.Sort {
-	case "domain":
-		req.SortBy([]string{"domain", "_id"})
-	case "date":
-		req.SortBy([]string{"-updated", "_id"})
-	case "visits":
-		req.SortBy([]string{"-add_count", "-updated", "_id"})
-	default:
-		sortByScore = true
-		req.SortBy([]string{"-_score", "-updated", "_id"})
-	}
+	sortDefinition := searchschema.Sort(q.Sort)
+	sortByScore := sortDefinition.ByScore
+	req.SortBy(sortDefinition.Fields)
 
 	if q.PageKey != "" {
 		var after []string
@@ -1591,7 +1508,7 @@ func Search(cfg *config.Config, q *Query) (*Results, error) {
 	}
 
 	// Run semantic search if enabled and the embedding infrastructure is available.
-	semanticText := querybuilder.RemoveStandaloneWildcards(q.Text)
+	semanticText := querybuilder.RemoveStandaloneWildcards(expression.Text)
 	if q.SemanticEnabled && i.embedder != nil && i.vectorStore != nil &&
 		strings.TrimSpace(semanticText) != "" {
 		r.SemanticEnabled = true
@@ -1723,6 +1640,9 @@ func (i *indexer) getAddCountByDocID(id string) (uint, bool) {
 // GetByDocID returns the document with the given bleve document ID, or nil if
 // none exists. The ID is the uid-prefixed form produced by document.GetDocID.
 func GetByDocID(id string) *document.Document {
+	if i == nil {
+		return nil
+	}
 	return i.getByDocID(id, resultIncludeAll)
 }
 
@@ -1777,7 +1697,7 @@ func (include resultInclude) has(flag resultInclude) bool {
 }
 
 func (idx *indexer) resFromHit(h *search.DocumentMatch, include resultInclude) *document.Document {
-	d := &document.Document{}
+	d := &document.Document{DocumentID: h.ID}
 	if t, ok := h.Fragments["title"]; ok {
 		d.Title = t[0]
 	} else if s, ok := h.Fields["title"].(string); ok {
@@ -1866,12 +1786,12 @@ func (idx *indexer) resFromHit(h *search.DocumentMatch, include resultInclude) *
 	return d
 }
 
-func (q *Query) create() query.Query {
+func (q *Query) create(text string) query.Query {
 	var sq query.Query
 	if q.MatchAll {
 		sq = query.NewMatchAllQuery()
 	} else {
-		sq = querybuilder.Build(q.Text)
+		sq = querybuilder.Build(text)
 	}
 
 	if q.DateFrom != 0 && q.DateTo == 0 {
@@ -2002,6 +1922,13 @@ func createMapping(lang string, keepStopwords bool) mapping.IndexMapping {
 	docMapping.AddFieldMappingsAt("html", noIdxMap)
 	docMapping.AddFieldMappingsAt("html_key", um)
 	docMapping.AddFieldMappingsAt("metadata", noIdxMap)
+	ignoredTextMap := bleve.NewTextFieldMapping()
+	ignoredTextMap.Store = false
+	ignoredTextMap.Index = false
+	ignoredTextMap.IncludeTermVectors = false
+	ignoredTextMap.IncludeInAll = false
+	ignoredTextMap.DocValues = false
+	docMapping.AddFieldMappingsAt("id", ignoredTextMap)
 	noStoreMap := bleve.NewBooleanFieldMapping()
 	noStoreMap.Store = false
 	noStoreMap.Index = false

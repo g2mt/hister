@@ -2,16 +2,17 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/asciimoo/hister/config"
+	"github.com/asciimoo/hister/server/indexer/searchschema"
 	"github.com/asciimoo/hister/server/model"
 	"github.com/asciimoo/hister/server/testutil"
-
-	"github.com/gorilla/sessions"
+	"github.com/asciimoo/hister/server/timeline"
 )
 
 func newPublicTokenTestServer(t *testing.T) (*config.Config, http.Handler) {
@@ -35,29 +36,29 @@ func newTokenTestServerWithLogLevel(t *testing.T, public bool, logLevel string) 
 	if err := cfg.SaveRules(); err != nil {
 		t.Fatal(err)
 	}
-	sessionStore = sessions.NewCookieStore([]byte(strings.Repeat("x", 32)))
-	sessionStore.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   60 * 60 * 24 * 365,
-		HttpOnly: true,
-	}
+	cfg.Server.Database = "file::memory:"
+	testutil.InitModelWithConfig(t, cfg)
+	sessionStore = newSessionStore([]byte(strings.Repeat("x", 32)), cfg.BaseURL(""), sessionMaxAge)
 	return cfg, registerEndpoints(cfg)
 }
 
 func TestPublicModeConfigResponse(t *testing.T) {
-	_, handler := newPublicTokenTestServer(t)
+	cfg, handler := newPublicTokenTestServer(t)
+	cfg.App.ColorScheme = "dark"
 	rec := testutil.ServeHTTP(t, handler, http.MethodGet, "/api/config", nil, nil)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /api/config status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	var body struct {
-		Title          string `json:"title"`
-		Subtitle       string `json:"subtitle"`
-		Public         bool   `json:"public"`
-		Authenticated  bool   `json:"authenticated"`
-		CanWrite       bool   `json:"canWrite"`
-		HistoryEnabled bool   `json:"historyEnabled"`
+		Title          string                    `json:"title"`
+		Subtitle       string                    `json:"subtitle"`
+		ColorScheme    string                    `json:"colorScheme"`
+		Public         bool                      `json:"public"`
+		Authenticated  bool                      `json:"authenticated"`
+		CanWrite       bool                      `json:"canWrite"`
+		HistoryEnabled bool                      `json:"historyEnabled"`
+		Search         searchschema.Capabilities `json:"search"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
@@ -67,6 +68,9 @@ func TestPublicModeConfigResponse(t *testing.T) {
 	}
 	if body.Subtitle != "Your own search engine" {
 		t.Fatalf("subtitle = %q, want %q", body.Subtitle, "Your own search engine")
+	}
+	if body.ColorScheme != "dark" {
+		t.Fatalf("colorScheme = %q, want %q", body.ColorScheme, "dark")
 	}
 	if !body.Public {
 		t.Fatal("public = false, want true")
@@ -80,14 +84,16 @@ func TestPublicModeConfigResponse(t *testing.T) {
 	if body.HistoryEnabled {
 		t.Fatal("historyEnabled = true, want false")
 	}
+	if body.Search.Version != searchschema.Version {
+		t.Fatalf("search schema version = %d, want %d", body.Search.Version, searchschema.Version)
+	}
+	if len(body.Search.Facets) == 0 || len(body.Search.Sort.Options) == 0 {
+		t.Fatal("search schema is missing facets or sort options")
+	}
 }
 
 func TestPublicModeAllowsDocumentedPublicRoutes(t *testing.T) {
-	cfg, handler := newPublicTokenTestServer(t)
-	dir := t.TempDir()
-	filePath := testutil.WriteFile(t, dir, "note.txt", []byte("public file"))
-	cfg.Indexer.Directories = []*config.Directory{{Path: dir}}
-
+	_, handler := newPublicTokenTestServer(t)
 	tests := []struct {
 		name   string
 		method string
@@ -97,7 +103,8 @@ func TestPublicModeAllowsDocumentedPublicRoutes(t *testing.T) {
 	}{
 		{name: "api docs", method: http.MethodGet, target: "/api", want: http.StatusOK},
 		{name: "search", method: http.MethodGet, target: "/search?format=json", want: http.StatusBadRequest},
-		{name: "file", method: http.MethodGet, target: "/api/file?path=" + filePath, want: http.StatusOK},
+		{name: "legacy file path", method: http.MethodGet, target: "/api/file?path=/tmp/note.txt", want: http.StatusBadRequest},
+		{name: "file", method: http.MethodGet, target: "/api/file?id=missing", want: http.StatusNotFound},
 		{name: "mcp tools list", method: http.MethodPost, target: "/mcp", body: `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, want: http.StatusOK},
 	}
 	for _, tt := range tests {
@@ -175,6 +182,31 @@ func TestTokenLoginSetsHttpOnlySessionCookieAndAuthenticates(t *testing.T) {
 	if !sessionCookie.HttpOnly {
 		t.Fatal("session cookie HttpOnly = false, want true")
 	}
+	if sessionCookie.Secure {
+		t.Fatal("HTTP session cookie Secure = true, want false")
+	}
+	if sessionCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("session cookie SameSite = %v, want %v", sessionCookie.SameSite, http.SameSiteLaxMode)
+	}
+	if sessionCookie.MaxAge != sessionMaxAge {
+		t.Fatalf("session cookie MaxAge = %d, want %d", sessionCookie.MaxAge, sessionMaxAge)
+	}
+	if !validSessionToken(sessionCookie.Value) {
+		t.Fatalf("session cookie does not contain an opaque %d byte identifier", sessionTokenBytes)
+	}
+	if strings.Contains(sessionCookie.Value, "secret") {
+		t.Fatal("session cookie contains the application access token")
+	}
+	storedSession, err := model.GetWebSession(sessionTokenHash(sessionCookie.Value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedSession.TokenHash == sessionCookie.Value {
+		t.Fatal("database stores the raw session identifier")
+	}
+	if strings.Contains(string(storedSession.Data), "secret") {
+		t.Fatal("server side session data contains the application access token")
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/add", nil)
 	req.AddCookie(sessionCookie)
@@ -210,9 +242,7 @@ func TestTokenLoginSetsHttpOnlySessionCookieAndAuthenticates(t *testing.T) {
 }
 
 func TestPublicModeEnablesHistoryForAuthenticatedCallers(t *testing.T) {
-	cfg, handler := newPublicTokenTestServer(t)
-	cfg.Server.Database = "file::memory:"
-	testutil.InitModelWithConfig(t, cfg)
+	_, handler := newPublicTokenTestServer(t)
 	anonymousRec := testutil.ServeHTTP(t, handler, http.MethodPost, "/api/history", strings.NewReader(`{"query":"q","url":"https://example.com","title":"Example"}`), map[string]string{
 		"Origin": "hister://",
 	})
@@ -244,12 +274,42 @@ func TestPublicModeEnablesHistoryForAuthenticatedCallers(t *testing.T) {
 	if len(items) != 1 || items[0].Query != "q" || items[0].URL != "https://example.com" {
 		t.Fatalf("saved history = %+v, want submitted item", items)
 	}
+
+	timelineRec := testutil.ServeHTTP(t, handler, http.MethodGet, "/api/history/timeline?opened=true&timezone=UTC", nil, map[string]string{
+		"X-Access-Token": "secret",
+	})
+	if timelineRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/history/timeline status = %d, want %d; body=%s", timelineRec.Code, http.StatusOK, timelineRec.Body.String())
+	}
+	var timelineBody timeline.Result
+	if err := json.Unmarshal(timelineRec.Body.Bytes(), &timelineBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(timelineBody.Days) != 7 || timelineBody.Days[0].Count != 1 {
+		t.Fatalf("timeline days = %+v, want one item today", timelineBody.Days)
+	}
+	drilldownURL := fmt.Sprintf(
+		"/api/history/timeline?opened=true&timezone=UTC&date_from=%d&date_to=%d",
+		timelineBody.Days[0].From,
+		timelineBody.Days[0].To,
+	)
+	drilldownRec := testutil.ServeHTTP(t, handler, http.MethodGet, drilldownURL, nil, map[string]string{
+		"X-Access-Token": "secret",
+	})
+	if drilldownRec.Code != http.StatusOK {
+		t.Fatalf("timeline drilldown status = %d, want %d; body=%s", drilldownRec.Code, http.StatusOK, drilldownRec.Body.String())
+	}
+	var drilldownBody timeline.DailyResult
+	if err := json.Unmarshal(drilldownRec.Body.Bytes(), &drilldownBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(drilldownBody.Days) != 1 || drilldownBody.Days[0].Count != 1 {
+		t.Fatalf("timeline drilldown days = %+v, want one item today", drilldownBody.Days)
+	}
 }
 
 func TestMCPGetHistoryOpenedMode(t *testing.T) {
-	cfg, handler := newTokenTestServer(t, false)
-	cfg.Server.Database = "file::memory:"
-	testutil.InitModelWithConfig(t, cfg)
+	_, handler := newTokenTestServer(t, false)
 	if err := model.UpdateHistory(0, "hister mcp", "https://example.com/mcp", "MCP result"); err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +326,8 @@ func TestMCPGetHistoryOpenedMode(t *testing.T) {
 	}
 	var body struct {
 		Result struct {
-			Content []mcpTextContent `json:"content"`
+			Content           []mcpTextContent    `json:"content"`
+			StructuredContent mcpStructuredResult `json:"structuredContent"`
 		} `json:"result"`
 		Error *mcpRPCError `json:"error"`
 	}
@@ -279,13 +340,26 @@ func TestMCPGetHistoryOpenedMode(t *testing.T) {
 	if len(body.Result.Content) != 1 {
 		t.Fatalf("content length = %d, want 1", len(body.Result.Content))
 	}
-	text := body.Result.Content[0].Text
+	if !strings.HasPrefix(body.Result.Content[0].Text, "SECURITY NOTICE:") {
+		t.Fatalf("text fallback lacks security notice: %s", body.Result.Content[0].Text)
+	}
+	if body.Result.StructuredContent.Trusted["mode"] != "opened" {
+		t.Fatalf("history mode = %#v, want opened", body.Result.StructuredContent.Trusted["mode"])
+	}
+	if len(body.Result.StructuredContent.UntrustedContent) != 2 {
+		t.Fatalf("untrusted history length = %d, want 2", len(body.Result.StructuredContent.UntrustedContent))
+	}
+	encodedContent, err := json.Marshal(body.Result.StructuredContent.UntrustedContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encodedContent)
 	for _, want := range []string{
-		"Opened history items: 2",
-		"Query: hister mcp",
-		"URL: https://example.com/mcp",
-		"Query: history view",
-		"URL: https://example.com/history",
+		`"trust":"untrusted"`,
+		`"query":"hister mcp"`,
+		`"url":"https://example.com/mcp"`,
+		`"query":"history view"`,
+		`"url":"https://example.com/history"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("history response missing %q in:\n%s", want, text)
@@ -304,7 +378,8 @@ func TestMCPGetHistoryDefaultsToIndexedMode(t *testing.T) {
 	}
 	var body struct {
 		Result struct {
-			Content []mcpTextContent `json:"content"`
+			Content           []mcpTextContent    `json:"content"`
+			StructuredContent mcpStructuredResult `json:"structuredContent"`
 		} `json:"result"`
 		Error *mcpRPCError `json:"error"`
 	}
@@ -317,8 +392,8 @@ func TestMCPGetHistoryDefaultsToIndexedMode(t *testing.T) {
 	if len(body.Result.Content) != 1 {
 		t.Fatalf("content length = %d, want 1", len(body.Result.Content))
 	}
-	if !strings.Contains(body.Result.Content[0].Text, "indexed history items") {
-		t.Fatalf("default history response did not use indexed mode:\n%s", body.Result.Content[0].Text)
+	if body.Result.StructuredContent.Trusted["mode"] != "indexed" {
+		t.Fatalf("default history mode = %#v, want indexed", body.Result.StructuredContent.Trusted["mode"])
 	}
 }
 

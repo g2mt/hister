@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,59 @@ import (
 
 	"github.com/blevesearch/bleve/v2"
 )
+
+func TestFileDocumentValidation(t *testing.T) {
+	testutil.InitModel(t)
+	user := testutil.CreateUser(t, "fileowner")
+	dir := t.TempDir()
+	idx := &indexer{directories: []*config.Directory{{
+		Path:      dir,
+		Filetypes: []string{"txt"},
+		Patterns:  []string{"note*"},
+		User:      user.Username,
+	}}}
+
+	if err := idx.validateFileDocument(&document.Document{URL: "https://example.com"}); err != nil {
+		t.Fatalf("web document rejected: %v", err)
+	}
+	if err := idx.validateFileDocument(&document.Document{
+		URL:    files.PathToFileURL(filepath.Join(dir, "note.txt")),
+		Text:   "submitted content",
+		UserID: user.ID,
+	}); err != nil {
+		t.Fatalf("allowed file document rejected: %v", err)
+	}
+
+	for _, d := range []*document.Document{
+		{URL: files.PathToFileURL(filepath.Join(dir, "note.txt")), UserID: user.ID},
+		{URL: files.PathToFileURL(filepath.Join(dir, "note.txt")), Text: "submitted content"},
+		{URL: files.PathToFileURL(filepath.Join(dir, "other.txt")), Text: "submitted content", UserID: user.ID},
+		{URL: files.PathToFileURL(filepath.Join(t.TempDir(), "note.txt")), Text: "submitted content", UserID: user.ID},
+	} {
+		if err := idx.validateFileDocument(d); !errors.Is(err, ErrFileURLNotAllowed) {
+			t.Fatalf("validation error = %v, want %v for %#v", err, ErrFileURLNotAllowed, d)
+		}
+	}
+}
+
+func TestAddFunctionsValidateFileDocuments(t *testing.T) {
+	idx := &indexer{}
+	d := &document.Document{
+		URL:       "file:///not/configured/note.txt",
+		Text:      "submitted content",
+		Processed: true,
+	}
+
+	originalIndexer := i
+	i = idx
+	t.Cleanup(func() { i = originalIndexer })
+	if err := Add(d); !errors.Is(err, ErrFileURLNotAllowed) {
+		t.Fatalf("Add error = %v, want %v", err, ErrFileURLNotAllowed)
+	}
+	if err := newMultiBatch(idx).Add(d); !errors.Is(err, ErrFileURLNotAllowed) {
+		t.Fatalf("MultiBatch.Add error = %v, want %v", err, ErrFileURLNotAllowed)
+	}
+}
 
 func TestDirectoryUserResolution(t *testing.T) {
 	testutil.InitModel(t)
@@ -130,6 +184,41 @@ func TestIndexFileWithUserID(t *testing.T) {
 
 	if err := IndexFile(testFile2, 0); err != nil {
 		t.Fatalf("IndexFile without user ID failed: %v", err)
+	}
+}
+
+func TestIndexFileAppliesDirectoryLabel(t *testing.T) {
+	testDir := t.TempDir()
+	testFile := testutil.WriteFile(t, testDir, "labeled.txt", []byte("sample labeled document content for indexing tests"))
+
+	idxCfg := testutil.Config(t)
+	idxCfg.Indexer.Directories = []*config.Directory{{Path: testDir, Label: "notes"}}
+	if err := Init(idxCfg); err != nil {
+		t.Fatalf("failed to init indexer: %v", err)
+	}
+	defer i.Close()
+
+	if err := IndexFile(testFile, 0); err != nil {
+		t.Fatalf("IndexFile failed: %v", err)
+	}
+	doc := GetByURLAndUser(files.PathToFileURL(testFile), 0)
+	if doc == nil {
+		t.Fatal("indexed file not found")
+	}
+	if doc.Label != "notes" {
+		t.Fatalf("Label = %q, want %q", doc.Label, "notes")
+	}
+
+	idxCfg.Indexer.Directories[0].Label = "archive"
+	if err := IndexFile(testFile, 0); err != nil {
+		t.Fatalf("IndexFile after label change failed: %v", err)
+	}
+	doc = GetByURLAndUser(files.PathToFileURL(testFile), 0)
+	if doc.Label != "archive" {
+		t.Fatalf("Label after config change = %q, want %q", doc.Label, "archive")
+	}
+	if doc.AddCount != 1 {
+		t.Fatalf("AddCount after label change = %d, want 1", doc.AddCount)
 	}
 }
 

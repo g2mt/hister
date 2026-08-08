@@ -44,7 +44,9 @@ You can search within specific fields using the `field:value` syntax:
 - **text:** - Search in page content only
 - **url:** - Search in URLs only (bare file paths without `://` are automatically resolved to absolute `file://` URLs)
 - **domain:** - Search in domain names only
+- **label:** - Search in document labels only
 - **language:** - Filter by detected language (e.g., `en`, `de`, `fr`. Use `unknown` for languages Hister doesn't support)
+- **metadata.KEY:** - Match an exact metadata value, such as `metadata.source:linkding`
 - **type:** - Filter by document type (`web` for websites, `file` or `local` for local files)
 - **visits:** - Filter by visit count, with exact values (`visits:1`), bounded ranges (`visits:2..4`), or open ranges (`visits:10..`)
 - **added:** Filter by when a document was first added, using a relative duration such as `added:>90d` or an absolute date such as `added:>=2026-04-01`
@@ -82,6 +84,18 @@ language:en
 ```
 
 Finds pages detected as English language.
+
+```textplain
+label:research
+```
+
+Finds documents with a matching label.
+
+```textplain
+metadata.source:linkding
+```
+
+Finds documents imported from Linkding.
 
 ```textplain
 type:file
@@ -137,6 +151,37 @@ visits:2..4 domain:example.com
 added:<7d domain:example.com
 user_id:3 domain:example.com
 ```
+
+## Sorting Results
+
+Use a `sort:` directive anywhere in the query to control result order. The directive controls
+ordering and is not matched against document content.
+
+```textplain
+golang sort:date
+```
+
+`sort:relevance` uses the default relevance order. `sort:date` shows the most recently updated
+documents first. `sort:visits` shows the most visited documents first. `sort:domain` groups results
+by domain.
+
+Prefix any sort value with a minus sign to reverse its direction. For example, `sort:-date` shows
+the oldest documents first, `sort:-visits` shows the least visited documents first, and
+`sort:-domain` orders domains from Z to A. `sort:-relevance` places the least relevant results
+first.
+
+```textplain
+golang sort:-date
+```
+
+A query containing only a sort directive matches all documents:
+
+```textplain
+sort:date
+```
+
+When a query contains more than one valid sort directive, the final directive takes precedence.
+Quoted text such as `"sort:date"` remains searchable text rather than changing the result order.
 
 ## Wildcard Searches
 

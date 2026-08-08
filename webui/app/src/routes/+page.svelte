@@ -36,13 +36,26 @@
   } from '$lib/search';
   import { RESULTS_PER_PAGE } from '$lib/search';
   import {
-    DATE_BUCKET_FILTERS,
     customDatesFromQuery,
-    removeUpdatedTimeFilters,
-    replaceUpdatedTimeFilters,
+    removeTimeFilters,
+    replaceTimeFilters,
     shiftISODate,
-    updatedTimeFilters,
+    timeFilters,
   } from '$lib/time-filters';
+  import { emptySearchCapabilities, queryFilterValues, valuesForFacet } from '$lib/search-schema';
+  import type { SearchCapabilities, SearchFacetDefinition } from '$lib/search-schema';
+  import {
+    removeSortDirectives,
+    replaceSortDirective,
+    sortDirectiveFromQuery,
+    sortValueFromQuery,
+  } from '$lib/sort-directive';
+  import {
+    applyQuerySuggestion,
+    buildQuerySuggestions,
+    facetSuggestionContext,
+  } from '$lib/query-suggestions';
+  import type { QuerySuggestion } from '$lib/query-suggestions';
   import { animate } from 'animejs';
   import { Input } from '@hister/components/ui/input';
   import { Button } from '@hister/components/ui/button';
@@ -53,7 +66,12 @@
   import * as DropdownMenu from '@hister/components/ui/dropdown-menu';
   import * as Tooltip from '@hister/components/ui/tooltip';
   import { ScrollArea } from '@hister/components/ui/scroll-area';
-  import { PreviewPanel, ResultActionsMenu, ResultFavicon } from '$lib/components';
+  import {
+    PreviewPanel,
+    QuerySuggestions,
+    ResultActionsMenu,
+    ResultFavicon,
+  } from '$lib/components';
   import { Kbd } from '@hister/components/ui/kbd';
   import {
     Search,
@@ -95,6 +113,7 @@
     public: boolean;
     canWrite: boolean;
     historyEnabled: boolean;
+    search: SearchCapabilities;
   }
 
   interface DisplayResult {
@@ -115,14 +134,6 @@
     isPinned: boolean;
   }
 
-  const sortOptions = [
-    { value: '', label: 'Relevance' },
-    { value: 'visits', label: 'Most visited' },
-    { value: 'date', label: 'Date (newest first)' },
-    { value: 'domain', label: 'Domain' },
-  ] as const;
-  const sortValues = new Set<string>(sortOptions.map((option) => option.value));
-
   let config: Config = $state({
     wsUrl: '',
     title: 'Hister',
@@ -137,7 +148,15 @@
     public: false,
     canWrite: true,
     historyEnabled: true,
+    search: emptySearchCapabilities(),
   });
+
+  const sortOptions = $derived(
+    config.search.sort.options
+      .filter((option) => option.visible)
+      .map((option) => ({ value: option.default ? '' : option.value, label: option.label })),
+  );
+  const sortValues = $derived(new Set(config.search.sort.options.map((option) => option.value)));
 
   let wsManager: WebSocketManager | undefined;
   let keyHandler: KeyHandler | undefined;
@@ -145,6 +164,15 @@
 
   let query = $state('');
   let autocomplete = $state('');
+  let queryCursor = $state(0);
+  let querySuggestionOpen = $state(false);
+  let querySuggestionIndex = $state(0);
+  let querySuggestionKeyboardActive = $state(false);
+  let querySuggestionFacets = $state<FacetsResult | null>(null);
+  let querySuggestionFacetKey = $state('');
+  let querySuggestionFacetsLoading = $state(false);
+  let searchAliases = $state<Record<string, string>>({});
+  let querySuggestionFacetRequest = 0;
   let connected = $state(false);
   let lastResults = $state<SearchResults | null>(null);
   let accumulatedDocs = $state<SearchResult[]>([]);
@@ -153,7 +181,7 @@
   let loadingMoreForQuery = $state('');
   let sentinelEl = $state<HTMLElement | undefined>();
   let highlightIdx = $state(0);
-  let currentSort = $state('');
+  const currentSort = $derived(sortValueFromQuery(query, config.search.sort));
   let dateFrom = $state('');
   let dateTo = $state('');
   let showPopup = $state(false);
@@ -192,9 +220,6 @@
     parseFloat(localStorage.getItem('hister-semantic-weight') ?? 'NaN') || 0.4,
   );
 
-  let contextMenuSearch: string | null = $state(null);
-  let contextMenuPos = $state({ x: 0, y: 0 });
-
   let showDeleteConfirm = $state(false);
   let deleteConfirmUrl = $state('');
   let deleteConfirmSkip = $state(false);
@@ -208,6 +233,8 @@
   let rulesCount = $state(0);
   let aliasesCount = $state(0);
   let historyCount = $state(0);
+  let statsLoaded = $state(false);
+  let statsAvailable = $state(false);
 
   let displayHistoryCount = $state(0);
   let displayRulesCount = $state(0);
@@ -215,10 +242,36 @@
 
   let heroTitleEl: HTMLElement | undefined = $state();
   let searchBoxEl: HTMLElement | undefined = $state();
-  let chipsContainerEl: HTMLElement | undefined = $state();
   let statsRowEl: HTMLElement | undefined = $state();
   let kbdEl: HTMLElement | null = $state(null);
   let underlineEl: HTMLElement | undefined = $state();
+
+  const querySuggestionListId = 'query-suggestions';
+  const queryFacetContext = $derived(facetSuggestionContext(query, queryCursor, config.search));
+  const querySuggestionFacetData = $derived(
+    queryFacetContext?.key === querySuggestionFacetKey ? querySuggestionFacets : null,
+  );
+  const querySuggestions = $derived(
+    buildQuerySuggestions({
+      query,
+      cursor: queryCursor,
+      aliases: searchAliases,
+      recentSearches,
+      capabilities: config.search,
+      facets: querySuggestionFacetData,
+      serverSuggestion: autocomplete,
+    }),
+  );
+  const querySuggestionsVisible = $derived(
+    query.trim().length > 0 &&
+      querySuggestionOpen &&
+      (querySuggestions.length > 0 || querySuggestionFacetsLoading),
+  );
+  const activeQuerySuggestionId = $derived(
+    querySuggestionsVisible && querySuggestionKeyboardActive && querySuggestions.length > 0
+      ? `${querySuggestionListId}-option-${querySuggestionIndex}`
+      : undefined,
+  );
 
   let animationHandles: any[] = [];
 
@@ -459,12 +512,20 @@
   ]);
 
   // Faceted navigation — lazy fetch on dropdown open
-  const bucketLabels: Record<string, string> = {
-    last_24h: 'Last 24 hours',
-    last_7d: 'Last 7 days',
-    last_30d: 'Last 30 days',
-    last_year: 'Last year',
-    older: 'Older',
+  const termFacetDefinitions = $derived(
+    config.search.facets.filter((facet) => facet.kind !== 'date_ranges'),
+  );
+  const dateFacetDefinition = $derived(
+    config.search.facets.find((facet) => facet.kind === 'date_ranges'),
+  );
+  const dateFacetValues = $derived(
+    dateFacetDefinition ? valuesForFacet(config.search, dateFacetDefinition) : [],
+  );
+  const facetIcons: Record<string, typeof Globe> = {
+    calendar: Calendar,
+    eye: Eye,
+    globe: Globe,
+    tag: Tag,
   };
   // facetsCache maps a canonical query key to the fetched FacetsResult.
   let facetsCache = $state(new Map<string, FacetsResult>());
@@ -475,10 +536,12 @@
   // Maps facet name (e.g. "domains", "languages") to the requested top-N size.
   let facetSizes = $state(new Map<string, number>());
 
-  const DEFAULT_FACET_SIZE = 10;
-
   function facetSize(name: string): number {
-    return facetSizes.get(name) ?? DEFAULT_FACET_SIZE;
+    return (
+      facetSizes.get(name) ??
+      config.search.facets.find((definition) => definition.name === name)?.defaultSize ??
+      0
+    );
   }
 
   function facetsCacheKey(): string {
@@ -496,7 +559,9 @@
     try {
       const params = new URLSearchParams({ q: query });
       for (const [name, size] of facetSizes) {
-        if (size !== DEFAULT_FACET_SIZE) params.set(`size_${name}`, String(size));
+        const defaultSize =
+          config.search.facets.find((definition) => definition.name === name)?.defaultSize ?? 0;
+        if (size !== defaultSize) params.set(`size_${name}`, String(size));
       }
       const res = await fetch(`api/facets?${params}`);
       if (res.ok) {
@@ -509,7 +574,10 @@
   }
 
   function loadMoreFacet(name: string) {
-    facetSizes = new Map(facetSizes).set(name, facetSize(name) + DEFAULT_FACET_SIZE);
+    const increment =
+      config.search.facets.find((definition) => definition.name === name)?.defaultSize ?? 0;
+    if (increment === 0) return;
+    facetSizes = new Map(facetSizes).set(name, facetSize(name) + increment);
     fetchFacets();
   }
 
@@ -524,43 +592,36 @@
     facetSizes = new Map();
   });
 
-  const activeDomainFilters = $derived(
-    new Set([...query.matchAll(/\bdomain:(\S+)/g)].map((m) => m[1])),
+  const activeFacetFilters = $derived(
+    new Map(
+      termFacetDefinitions.map((facet) => [facet.name, queryFilterValues(query, facet.queryField)]),
+    ),
   );
-  const activeLanguageFilters = $derived(
-    new Set([...query.matchAll(/\blanguage:(\S+)/g)].map((m) => m[1])),
-  );
-  const activeTypeFilters = $derived(
-    new Set([...query.matchAll(/\btype:(\S+)/g)].map((m) => m[1])),
-  );
-  const activeVisitFilters = $derived(
-    new Set([...query.matchAll(/\bvisits:(\S+)/g)].map((m) => m[1])),
-  );
-  const activeUpdatedTimeFilters = $derived(updatedTimeFilters(query));
+  const activeTimeFilters = $derived(timeFilters(query, dateFacetDefinition?.queryField ?? ''));
   const activeDateBucket = $derived(
-    activeUpdatedTimeFilters.length === 1
-      ? (Object.entries(DATE_BUCKET_FILTERS).find(
-          ([, value]) =>
-            value ===
-            `${activeUpdatedTimeFilters[0].comparison}${activeUpdatedTimeFilters[0].value.toLowerCase()}`,
-        )?.[0] ?? null)
+    activeTimeFilters.length === 1
+      ? (dateFacetValues.find(
+          (value) =>
+            value.value ===
+            `${activeTimeFilters[0].comparison}${activeTimeFilters[0].value.toLowerCase()}`,
+        )?.facetBucket ?? null)
       : null,
   );
   const activeFilterCount = $derived(
-    activeDomainFilters.size +
-      activeLanguageFilters.size +
-      activeTypeFilters.size +
-      activeVisitFilters.size +
-      (activeUpdatedTimeFilters.length > 0 ? 1 : 0),
+    [...activeFacetFilters.values()].reduce((total, filters) => total + filters.size, 0) +
+      (activeTimeFilters.length > 0 ? 1 : 0),
   );
 
-  function showFacetCategory(name: string, activeFilters: Set<string>) {
-    return (currentFacets?.terms?.[name]?.terms?.length ?? 0) > 1 || activeFilters.size > 0;
+  function showFacetCategory(facet: SearchFacetDefinition) {
+    return (
+      (currentFacets?.terms?.[facet.name]?.terms?.length ?? 0) > 1 ||
+      (activeFacetFilters.get(facet.name)?.size ?? 0) > 0
+    );
   }
-  const showDomainsFacet = $derived(showFacetCategory('domains', activeDomainFilters));
-  const showLanguagesFacet = $derived(showFacetCategory('languages', activeLanguageFilters));
-  const showTypesFacet = $derived(showFacetCategory('types', activeTypeFilters));
-  const showVisitsFacet = $derived(showFacetCategory('visits', activeVisitFilters));
+  function activeFiltersForFacet(name: string): Set<string> {
+    return activeFacetFilters.get(name) ?? new Set<string>();
+  }
+  const visibleTermFacets = $derived(termFacetDefinitions.filter(showFacetCategory));
   const showFiltersButton = $derived(hasResults || activeFilterCount > 0);
 
   function toggleQueryToken(prefix: string, value: string) {
@@ -573,11 +634,12 @@
   }
 
   function toggleDateBucket(name: string) {
+    const field = dateFacetDefinition?.queryField ?? '';
     if (activeDateBucket === name) {
-      query = removeUpdatedTimeFilters(query);
+      query = removeTimeFilters(query, field);
     } else {
-      const filter = DATE_BUCKET_FILTERS[name];
-      if (filter) query = replaceUpdatedTimeFilters(query, [filter]);
+      const filter = dateFacetValues.find((value) => value.facetBucket === name)?.value;
+      if (filter) query = replaceTimeFilters(query, field, [filter]);
     }
   }
 
@@ -590,11 +652,11 @@
     if (shiftISODate(from, 0)) filters.push(`>=${from}`);
     const exclusiveTo = shiftISODate(to, 1);
     if (exclusiveTo) filters.push(`<${exclusiveTo}`);
-    query = replaceUpdatedTimeFilters(query, filters);
+    query = replaceTimeFilters(query, dateFacetDefinition?.queryField ?? '', filters);
   }
 
   $effect(() => {
-    const dates = customDatesFromQuery(query);
+    const dates = customDatesFromQuery(query, dateFacetDefinition?.queryField ?? '');
     untrack(() => {
       dateFrom = dates.from;
       dateTo = dates.to;
@@ -620,7 +682,6 @@
 
   function searchQueryOpts(pageKey = ''): SearchQueryOptions {
     return {
-      sort: currentSort,
       semantic: { enabled: semanticOn && config.semanticEnabled, threshold: similarityThreshold },
       pageKey,
       limit: RESULTS_PER_PAGE,
@@ -645,14 +706,22 @@
 
   // --- URL builders ---
 
-  function parseSortParam(value: string | null): string {
-    return value && sortValues.has(value) ? value : '';
+  function queryFromSearchParams(params: URLSearchParams): string {
+    let value = params.get('q') || '';
+    const legacySort = params.get('sort');
+    if (
+      legacySort &&
+      sortValues.has(legacySort) &&
+      sortDirectiveFromQuery(value, config.search.sort) === null
+    ) {
+      value = replaceSortDirective(value, legacySort, config.search.sort);
+    }
+    return value;
   }
 
   function buildSearchUrl(): string {
     const params = new URLSearchParams();
     if (query) params.set('q', query);
-    if (currentSort) params.set('sort', currentSort);
     const search = params.toString();
     return `${base}/${search ? `?${search}` : ''}`;
   }
@@ -661,13 +730,13 @@
 
   function pushSearchHistory() {
     const url = buildSearchUrl();
-    history.pushState({ type: 'search', query, sort: currentSort }, '', url);
+    history.pushState({ type: 'search', query }, '', url);
     lastPushedEmpty = !query;
   }
 
   function replaceSearchHistory() {
     const url = buildSearchUrl();
-    history.replaceState({ type: 'search', query, sort: currentSort }, '', url);
+    history.replaceState({ type: 'search', query }, '', url);
     lastPushedEmpty = !query;
   }
 
@@ -700,8 +769,7 @@
     previewFullscreen = false;
     skipUrl.value = true;
     const params = new URLSearchParams(window.location.search);
-    query = params.get('q') || '';
-    currentSort = parseSortParam(params.get('sort'));
+    query = queryFromSearchParams(params);
     lastPushedEmpty = !query;
     if (query && connected) sendQuery(query);
     if (!query) {
@@ -774,8 +842,7 @@
 
   function setSort(sortId: string) {
     if (currentSort === sortId) return;
-    currentSort = sortId;
-    if (query) sendQuery(query);
+    query = replaceSortDirective(query, sortId, config.search.sort);
   }
 
   function setDeleteError(msg: string) {
@@ -841,7 +908,8 @@
 
   async function deleteAllResults() {
     if (!config.canWrite) return;
-    const q = query + (getUserId() !== undefined ? ' user_id:' + getUserId() : '');
+    const searchText = removeSortDirectives(query, config.search.sort) || '*';
+    const q = searchText + (getUserId() !== undefined ? ' user_id:' + getUserId() : '');
     const res = await apiFetch('/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -894,13 +962,10 @@
     if (lastResults) lastResults = { ...lastResults, documents: accumulatedDocs };
   }
 
-  // Convert a file:// URL to a server-side /api/file?path= URL for in-browser viewing.
-  // On Windows, strips the extra leading slash before the drive letter (file:///C:/ → C:/).
-  function fileResultUrl(url: string): string {
-    if (!url.startsWith('file://')) return url;
-    let path = url.slice('file://'.length);
-    if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1);
-    return 'api/file?path=' + encodeURIComponent(path);
+  // Convert a file URL to a document authorized server URL for browser viewing.
+  function fileResultUrl(url: string, documentID?: string): string {
+    if (!url.startsWith('file://') || !documentID) return url;
+    return 'api/file?id=' + encodeURIComponent(documentID);
   }
 
   function displayResultPath(url: string, domain: string): string {
@@ -1026,6 +1091,88 @@
     }
   }
 
+  function handleQueryInput(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    query = target.value;
+    queryCursor = target.selectionStart ?? target.value.length;
+    querySuggestionIndex = 0;
+    querySuggestionKeyboardActive = false;
+    querySuggestionOpen = true;
+  }
+
+  function handleQuerySelection(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    queryCursor = target.selectionStart ?? target.value.length;
+    querySuggestionIndex = 0;
+    querySuggestionKeyboardActive = false;
+    querySuggestionOpen = true;
+  }
+
+  function handleQueryFocus(event: FocusEvent) {
+    handleQuerySelection(event);
+  }
+
+  function handleQueryBlur() {
+    querySuggestionOpen = false;
+    querySuggestionKeyboardActive = false;
+  }
+
+  function selectQuerySuggestion(suggestion: QuerySuggestion) {
+    const applied = applyQuerySuggestion(query, queryCursor, suggestion);
+    query = applied.query;
+    queryCursor = applied.cursor;
+    querySuggestionIndex = 0;
+    querySuggestionKeyboardActive = false;
+    querySuggestionOpen = suggestion.keepOpen ?? false;
+    tick().then(() => {
+      inputEl?.focus();
+      inputEl?.setSelectionRange(applied.cursor, applied.cursor);
+      if (suggestion.keepOpen) querySuggestionOpen = true;
+    });
+  }
+
+  function setActiveQuerySuggestion(index: number) {
+    querySuggestionIndex = index;
+    querySuggestionKeyboardActive = true;
+  }
+
+  function handleQueryInputKeydown(event: KeyboardEvent) {
+    if (!querySuggestionsVisible || querySuggestions.length === 0) return;
+
+    if (event.key === 'Tab' && event.shiftKey) {
+      event.stopPropagation();
+      return;
+    }
+
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!querySuggestionKeyboardActive) {
+        querySuggestionIndex = event.key === 'ArrowDown' ? 0 : querySuggestions.length - 1;
+      } else {
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        querySuggestionIndex =
+          (querySuggestionIndex + direction + querySuggestions.length) % querySuggestions.length;
+      }
+      querySuggestionKeyboardActive = true;
+      return;
+    }
+
+    if (event.key === 'Tab' || (event.key === 'Enter' && querySuggestionKeyboardActive)) {
+      event.preventDefault();
+      event.stopPropagation();
+      selectQuerySuggestion(querySuggestions[querySuggestionIndex] ?? querySuggestions[0]);
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      querySuggestionOpen = false;
+      querySuggestionKeyboardActive = false;
+    }
+  }
+
   function openQueryInSearchEngine(e?: KeyboardEvent) {
     if (e) e.preventDefault();
     openURL(getSearchUrl(config.searchUrl, query));
@@ -1093,11 +1240,6 @@
         e.preventDefault();
         return;
       }
-      if (contextMenuSearch) {
-        contextMenuSearch = null;
-        e.preventDefault();
-        return;
-      }
       if (closePopup()) {
         e.preventDefault();
         return;
@@ -1108,7 +1250,6 @@
         return;
       }
     }
-    contextMenuSearch = null;
   }
 
   function clickChip(q: string) {
@@ -1122,7 +1263,6 @@
       'deletedSearches',
       JSON.stringify([...JSON.parse(localStorage.getItem('deletedSearches') || '[]'), q]),
     );
-    contextMenuSearch = null;
   }
 
   function deleteAllRecentSearches() {
@@ -1136,13 +1276,21 @@
     recentSearches = [];
   }
 
-  function showChipContextMenu(e: MouseEvent, q: string) {
-    e.preventDefault();
-    contextMenuSearch = q;
-    contextMenuPos = { x: e.clientX, y: e.clientY };
+  async function loadQueryAliases() {
+    if (!config.canWrite) return;
+    try {
+      const res = await apiFetch('/rules', {
+        headers: { Accept: 'application/json' },
+        redirectOnForbidden: false,
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      searchAliases = data.aliases ?? {};
+    } catch {}
   }
 
   async function loadHomeStats() {
+    statsAvailable = false;
     try {
       const statsRes = await apiFetch('/stats', { headers: { Accept: 'application/json' } });
 
@@ -1151,6 +1299,7 @@
         rulesCount = stats.rule_count ?? 0;
         aliasesCount = stats.alias_count ?? 0;
         historyCount = stats.doc_count ?? 0;
+        statsAvailable = true;
         recentSearches = [];
         if (stats.recent_searches) {
           const deletedSearches: string[] = JSON.parse(
@@ -1162,12 +1311,10 @@
         }
       }
     } catch (e) {
-      console.log('Failed to retreive stats', e);
+      console.log('Failed to retrieve stats', e);
     }
     statsLoaded = true;
   }
-
-  let statsLoaded = $state(false);
 
   function addAnimation(target: HTMLElement | null | undefined, options: any) {
     if (!target) {
@@ -1250,7 +1397,7 @@
   });
 
   $effect(() => {
-    if (statsLoaded && !isSearching) {
+    if (statsLoaded && statsAvailable && !isSearching) {
       tick().then(() => animateCounters());
     }
   });
@@ -1261,6 +1408,47 @@
       await tick();
       inputEl?.focus();
     })();
+  });
+  $effect(() => {
+    const count = querySuggestions.length;
+    if (count === 0) {
+      querySuggestionIndex = 0;
+      querySuggestionKeyboardActive = false;
+    } else if (querySuggestionIndex >= count) {
+      querySuggestionIndex = count - 1;
+    }
+  });
+  $effect(() => {
+    const context = queryFacetContext;
+    const isOpen = querySuggestionOpen;
+    const request = ++querySuggestionFacetRequest;
+    if (!context || !isOpen) {
+      querySuggestionFacetsLoading = false;
+      return;
+    }
+
+    querySuggestionFacetsLoading = true;
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({ q: context.baseQuery });
+        params.set(`size_${context.facetName}`, '20');
+        const res = await apiFetch(`/facets?${params}`, { signal: controller.signal });
+        if (!res.ok || request !== querySuggestionFacetRequest) return;
+        querySuggestionFacets = await res.json();
+        querySuggestionFacetKey = context.key;
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          querySuggestionFacets = null;
+        }
+      } finally {
+        if (request === querySuggestionFacetRequest) querySuggestionFacetsLoading = false;
+      }
+    }, 120);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   });
   $effect(() => {
     if (query && connected) {
@@ -1319,10 +1507,8 @@
   });
   $effect.pre(() => {
     const urlParams = new URLSearchParams(window.location.search);
-    const q = urlParams.get('q') || '';
-    const sort = urlParams.get('sort');
+    const q = queryFromSearchParams(urlParams);
     if (q) query = q;
-    currentSort = parseSortParam(sort);
     lastPushedEmpty = !q;
   });
 
@@ -1354,13 +1540,14 @@
         searchUrl: appConfig.searchUrl,
         openResultsOnNewTab: appConfig.openResultsOnNewTab,
         hotkeys: appConfig.hotkeys,
-        semanticEnabled: (appConfig as any).semanticEnabled ?? false,
-        similarityThreshold: (appConfig as any).similarityThreshold ?? 0.1,
-        semanticWeight: (appConfig as any).semanticWeight ?? 0.4,
+        semanticEnabled: appConfig.semanticEnabled ?? false,
+        similarityThreshold: appConfig.similarityThreshold ?? 0.1,
+        semanticWeight: appConfig.semanticWeight ?? 0.4,
         authenticated: appConfig.authenticated,
         public: appConfig.public,
         canWrite: appConfig.canWrite,
         historyEnabled: appConfig.historyEnabled,
+        search: appConfig.search,
       };
       disablePreviews = (appConfig as any).disablePreviews ?? false;
       if (config.semanticEnabled) {
@@ -1381,6 +1568,7 @@
       connect();
       keyHandler = new KeyHandler(config.hotkeys, hotkeyActions);
       loadHomeStats();
+      loadQueryAliases();
     })();
     const mq = window.matchMedia('(min-width: 1280px)');
     isDesktop = mq.matches;
@@ -1540,85 +1728,105 @@
 
 {#if isSearching}
   <div class="flex min-h-0 flex-1 flex-col">
-    <div
-      class="search bg-page-bg border-brutal-border flex h-10 shrink-0 items-center gap-3 border-b-[3px] px-4 md:h-14"
-    >
-      <Search class="text-text-brand-muted size-4 md:size-6" />
-      <Input
-        bind:ref={inputEl}
-        bind:value={query}
-        type="search"
-        placeholder="Search..."
-        class="font-inter text-text-brand placeholder:text-text-brand-muted h-full flex-1 border-0 bg-transparent p-0 text-lg font-medium shadow-none focus-visible:ring-0 md:text-2xl"
-      />
-      {#if config.semanticEnabled}
-        <Tooltip.Provider delayDuration={0}>
-          <Tooltip.Root>
-            <Tooltip.Trigger>
-              <button
-                type="button"
-                onclick={() => (semanticOn = !semanticOn)}
-                class="flex shrink-0 items-center gap-1 px-1.5 py-0.5 text-xs font-semibold transition-colors {semanticOn
-                  ? 'text-hister-indigo'
-                  : 'text-text-brand-muted hover:text-hister-indigo'}"
-                aria-pressed={semanticOn}
-                aria-label="Toggle semantic search"
-              >
-                <Sparkles class="size-3.5" />
-                <span class="hidden md:inline">Semantic</span>
-              </button>
-            </Tooltip.Trigger>
-            <Tooltip.Portal>
-              <Tooltip.Content>
-                {semanticOn ? 'Semantic search on' : 'Semantic search off'} — click to toggle
-              </Tooltip.Content>
-            </Tooltip.Portal>
-          </Tooltip.Root>
-        </Tooltip.Provider>
-      {/if}
-      <div class="flex shrink-0 items-center gap-1">
-        {#if query}
-          <button
-            type="button"
-            class="text-text-brand-muted hover:bg-muted-surface hover:text-text-brand flex h-8 w-8 items-center justify-center transition-colors md:h-9 md:w-9"
-            aria-label="Clear search"
-            title="Clear search"
-            onclick={() => {
-              query = '';
-              resultsShown = false;
-              inputEl?.focus();
-            }}
-          >
-            <X class="size-4" />
-          </button>
+    <div class="relative z-40 shrink-0">
+      <div
+        class="search bg-page-bg border-brutal-border flex h-10 items-center gap-3 border-b-[3px] px-4 md:h-14"
+      >
+        <Search class="text-text-brand-muted size-4 md:size-6" />
+        <Input
+          bind:ref={inputEl}
+          bind:value={query}
+          type="search"
+          placeholder="Search..."
+          aria-autocomplete="list"
+          aria-controls={querySuggestionsVisible ? querySuggestionListId : undefined}
+          aria-expanded={querySuggestionsVisible}
+          aria-haspopup="listbox"
+          aria-activedescendant={activeQuerySuggestionId}
+          oninput={handleQueryInput}
+          onfocus={handleQueryFocus}
+          onblur={handleQueryBlur}
+          onselect={handleQuerySelection}
+          onclick={handleQuerySelection}
+          onkeydown={handleQueryInputKeydown}
+          class="font-inter text-text-brand placeholder:text-text-brand-muted h-full flex-1 border-0 bg-transparent p-0 text-lg font-medium shadow-none focus-visible:ring-0 md:text-2xl"
+        />
+        {#if config.semanticEnabled}
+          <Tooltip.Provider delayDuration={0}>
+            <Tooltip.Root>
+              <Tooltip.Trigger>
+                <button
+                  type="button"
+                  onclick={() => (semanticOn = !semanticOn)}
+                  class="flex shrink-0 items-center gap-1 px-1.5 py-0.5 text-xs font-semibold transition-colors {semanticOn
+                    ? 'text-hister-indigo'
+                    : 'text-text-brand-muted hover:text-hister-indigo'}"
+                  aria-pressed={semanticOn}
+                  aria-label="Toggle semantic search"
+                >
+                  <Sparkles class="size-3.5" />
+                  <span class="hidden md:inline">Semantic</span>
+                </button>
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Content>
+                  {semanticOn ? 'Semantic search on' : 'Semantic search off'} — click to toggle
+                </Tooltip.Content>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+          </Tooltip.Provider>
         {/if}
-        <Tooltip.Provider delayDuration={0}>
-          <Tooltip.Root>
-            <Tooltip.Trigger>
-              <button
-                type="button"
-                class="text-text-brand-muted hover:bg-muted-surface flex h-8 items-center gap-2 px-2 text-xs font-semibold transition-colors md:h-9 md:px-3"
-                aria-label="Server {connected ? 'connected' : 'disconnected'}"
-              >
-                <span class="h-2 w-2 shrink-0 {connected ? 'bg-hister-lime' : 'bg-hister-rose'}"
-                ></span>
-                <span class="hidden md:inline">{connected ? 'Online' : 'Offline'}</span>
-              </button>
-            </Tooltip.Trigger>
-            <Tooltip.Portal>
-              <Tooltip.Content>
-                Server: {connected ? 'Connected' : 'Disconnected'}
-              </Tooltip.Content>
-            </Tooltip.Portal>
-          </Tooltip.Root>
-        </Tooltip.Provider>
+        <div class="flex shrink-0 items-center gap-1">
+          {#if query}
+            <button
+              type="button"
+              class="text-text-brand-muted hover:bg-muted-surface hover:text-text-brand flex h-8 w-8 items-center justify-center transition-colors md:h-9 md:w-9"
+              aria-label="Clear search"
+              title="Clear search"
+              onclick={() => {
+                query = '';
+                queryCursor = 0;
+                querySuggestionOpen = true;
+                resultsShown = false;
+                inputEl?.focus();
+              }}
+            >
+              <X class="size-4" />
+            </button>
+          {/if}
+          <Tooltip.Provider delayDuration={0}>
+            <Tooltip.Root>
+              <Tooltip.Trigger>
+                <button
+                  type="button"
+                  class="text-text-brand-muted hover:bg-muted-surface flex h-8 items-center gap-2 px-2 text-xs font-semibold transition-colors md:h-9 md:px-3"
+                  aria-label="Server {connected ? 'connected' : 'disconnected'}"
+                >
+                  <span class="h-2 w-2 shrink-0 {connected ? 'bg-hister-lime' : 'bg-hister-rose'}"
+                  ></span>
+                  <span class="hidden md:inline">{connected ? 'Online' : 'Offline'}</span>
+                </button>
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Content>
+                  Server: {connected ? 'Connected' : 'Disconnected'}
+                </Tooltip.Content>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+          </Tooltip.Provider>
+        </div>
       </div>
+      <QuerySuggestions
+        id={querySuggestionListId}
+        floating={false}
+        open={querySuggestionOpen}
+        suggestions={querySuggestions}
+        activeIndex={querySuggestionKeyboardActive ? querySuggestionIndex : -1}
+        loading={querySuggestionFacetsLoading}
+        onactivechange={setActiveQuerySuggestion}
+        onselect={selectQuerySuggestion}
+      />
     </div>
-    {#if autocomplete && autocomplete !== query}
-      <span class="font-fira text-text-brand-muted mx-8 text-sm">
-        Tab: <span class="text-hister-indigo">{autocomplete}</span>
-      </span>
-    {/if}
 
     <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitContainerEl}>
       {#if !previewFullscreen}
@@ -1679,7 +1887,7 @@
                             Filters
                             {#if activeFilterCount > 0}
                               <span
-                                class="bg-hister-indigo text-background flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold leading-none"
+                                class="bg-hister-indigo text-background flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] leading-none font-bold"
                                 >{activeFilterCount}</span
                               >
                             {/if}
@@ -1696,13 +1904,11 @@
                       >
                         <div class="space-y-3">
                           {#snippet facetSection(
-                            facetName: string,
-                            label: string,
-                            Icon: typeof Globe,
-                            prefix: string,
+                            facet: SearchFacetDefinition,
                             activeFilters: Set<string>,
                             showSeparator: boolean,
                           )}
+                            {@const Icon = facetIcons[facet.icon ?? ''] ?? Filter}
                             {#if showSeparator}
                               <Separator class="bg-border-brand-muted" />
                             {/if}
@@ -1711,27 +1917,27 @@
                                 class="font-inter text-text-brand-muted flex items-center gap-1.5 text-xs font-semibold"
                               >
                                 <Icon class="size-3" />
-                                {label}
+                                {facet.label}
                               </p>
                               <div class="flex flex-wrap gap-1">
-                                {#each currentFacets?.terms?.[facetName]?.terms ?? [] as { term, count, label } (term)}
+                                {#each currentFacets?.terms?.[facet.name]?.terms ?? [] as { term, count, label } (term)}
                                   <button
                                     class="font-inter cursor-pointer rounded-none border-[2px] px-2 py-0.5 text-xs transition-colors {activeFilters.has(
                                       term,
                                     )
                                       ? 'border-hister-indigo bg-hister-indigo text-background'
                                       : 'border-border-brand-muted text-text-brand-secondary hover:border-hister-indigo hover:text-hister-indigo'}"
-                                    onclick={() => toggleQueryToken(prefix, term)}
+                                    onclick={() => toggleQueryToken(facet.queryField, term)}
                                   >
                                     {label ?? term}
                                     <span class="opacity-60">({count})</span>
                                   </button>
                                 {/each}
                               </div>
-                              {#if currentFacets?.terms?.[facetName]?.other}
+                              {#if currentFacets?.terms?.[facet.name]?.other}
                                 <button
                                   class="font-inter text-text-brand-muted hover:text-hister-indigo mt-1 cursor-pointer text-xs underline-offset-2 hover:underline"
-                                  onclick={() => loadMoreFacet(facetName)}>Load more</button
+                                  onclick={() => loadMoreFacet(facet.name)}>Load more</button
                                 >
                               {/if}
                             </div>
@@ -1739,46 +1945,13 @@
                           {#if facetsLoading}
                             <p class="font-inter text-text-brand-muted text-xs">Loading filters…</p>
                           {:else}
-                            {#if showDomainsFacet}
+                            {#each visibleTermFacets as facet, index (facet.name)}
                               {@render facetSection(
-                                'domains',
-                                'Domains',
-                                Globe,
-                                'domain',
-                                activeDomainFilters,
-                                false,
+                                facet,
+                                activeFiltersForFacet(facet.name),
+                                index > 0,
                               )}
-                            {/if}
-                            {#if showLanguagesFacet}
-                              {@render facetSection(
-                                'languages',
-                                'Languages',
-                                Globe,
-                                'language',
-                                activeLanguageFilters,
-                                showDomainsFacet,
-                              )}
-                            {/if}
-                            {#if showTypesFacet}
-                              {@render facetSection(
-                                'types',
-                                'Type',
-                                Tag,
-                                'type',
-                                activeTypeFilters,
-                                showDomainsFacet || showLanguagesFacet,
-                              )}
-                            {/if}
-                            {#if showVisitsFacet}
-                              {@render facetSection(
-                                'visits',
-                                'Visits',
-                                Eye,
-                                'visits',
-                                activeVisitFilters,
-                                showDomainsFacet || showLanguagesFacet || showTypesFacet,
-                              )}
-                            {/if}
+                            {/each}
                             {#snippet customDateInputs()}
                               <details class="group/custom w-full">
                                 <summary
@@ -1811,16 +1984,18 @@
                                 </div>
                               </details>
                             {/snippet}
-                            {#if currentFacets?.date_histogram?.some((b) => b.count > 0)}
-                              {#if showDomainsFacet || showLanguagesFacet || showTypesFacet || showVisitsFacet}
+                            {#if dateFacetDefinition && currentFacets?.date_histogram?.some((b) => b.count > 0)}
+                              {@const DateIcon =
+                                facetIcons[dateFacetDefinition.icon ?? ''] ?? Filter}
+                              {#if visibleTermFacets.length > 0}
                                 <Separator class="bg-border-brand-muted" />
                               {/if}
                               <div class="space-y-1.5">
                                 <p
                                   class="font-inter text-text-brand-muted flex items-center gap-1.5 text-xs font-semibold"
                                 >
-                                  <Calendar class="size-3" />
-                                  Updated
+                                  <DateIcon class="size-3" />
+                                  {dateFacetDefinition.label}
                                 </p>
                                 <div class="flex flex-col gap-1">
                                   {#each currentFacets.date_histogram as { name, count } (name)}
@@ -1832,7 +2007,11 @@
                                           : 'border-border-brand-muted text-text-brand-secondary hover:border-hister-indigo hover:text-hister-indigo'}"
                                         onclick={() => toggleDateBucket(name)}
                                       >
-                                        <span>{bucketLabels[name] ?? name}</span>
+                                        <span
+                                          >{dateFacetValues.find(
+                                            (value) => value.facetBucket === name,
+                                          )?.label ?? name}</span
+                                        >
                                         <span class="opacity-60">{count}</span>
                                       </button>
                                     {/if}
@@ -1840,18 +2019,20 @@
                                 </div>
                                 {@render customDateInputs()}
                               </div>
-                            {:else}
+                            {:else if dateFacetDefinition}
+                              {@const DateIcon =
+                                facetIcons[dateFacetDefinition.icon ?? ''] ?? Filter}
                               <div class="space-y-1.5">
                                 <p
                                   class="font-inter text-text-brand-muted flex items-center gap-1.5 text-xs font-semibold"
                                 >
-                                  <Calendar class="size-3" />
-                                  Updated
+                                  <DateIcon class="size-3" />
+                                  {dateFacetDefinition.label}
                                 </p>
                                 {@render customDateInputs()}
                               </div>
                             {/if}
-                            {#if !currentFacets?.terms?.['domains']?.terms?.length && !currentFacets?.terms?.['languages']?.terms?.length && !currentFacets?.terms?.['types']?.terms?.length && !currentFacets?.terms?.['visits']?.terms?.length && !currentFacets?.date_histogram?.some((b) => b.count > 0)}
+                            {#if !termFacetDefinitions.some((facet) => currentFacets?.terms?.[facet.name]?.terms?.length) && !currentFacets?.date_histogram?.some((bucket) => bucket.count > 0)}
                               <p class="font-inter text-text-brand-muted text-xs">
                                 No filters available for this query.
                               </p>
@@ -2008,7 +2189,7 @@
                           Sort
                           {#if currentSort}
                             <span
-                              class="bg-hister-indigo text-background flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold leading-none"
+                              class="bg-hister-indigo text-background flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] leading-none font-bold"
                               >1</span
                             >
                           {/if}
@@ -2094,7 +2275,7 @@
                         />
                         <a
                           data-result-link={r.url}
-                          href={fileResultUrl(r.url)}
+                          href={fileResultUrl(r.url, r.id)}
                           class="result-title font-outfit text-md line-clamp-3 min-w-0 flex-1 font-semibold hover:underline md:text-xl"
                           title={r.title || '*title*'}
                           target={config.openResultsOnNewTab ? '_blank' : undefined}
@@ -2124,10 +2305,10 @@
                         />
                       </div>
                       <div
-                        class="result-meta flex min-w-0 max-w-full items-center gap-x-3 gap-y-1 overflow-hidden"
+                        class="result-meta flex max-w-full min-w-0 items-center gap-x-3 gap-y-1 overflow-hidden"
                       >
                         <div
-                          class="result-url-line flex min-w-0 max-w-full shrink items-center gap-1.5"
+                          class="result-url-line flex max-w-full min-w-0 shrink items-center gap-1.5"
                         >
                           {#if r.add_count && r.add_count > 1}
                             <span
@@ -2138,7 +2319,7 @@
                             </span>
                           {/if}
                           <span
-                            class="result-url-text min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-xs md:text-sm"
+                            class="result-url-text min-w-0 overflow-hidden text-xs text-ellipsis whitespace-nowrap md:text-sm"
                             title={r.url}
                           >
                             {#if r.domain}<span class="result-domain font-inter font-semibold"
@@ -2163,7 +2344,7 @@
                             }}
                           >
                             {#if copiedUrl === r.url}
-                              <Check class="size-3 text-hister-teal" />
+                              <Check class="text-hister-teal size-3" />
                             {:else}
                               <Copy class="size-3" />
                             {/if}
@@ -2337,33 +2518,46 @@
       style="background: linear-gradient(90deg, var(--hister-indigo), var(--hister-coral), var(--hister-teal)); transform: scaleX(0); transform-origin: left;"
     ></div>
 
-    <div
-      bind:this={searchBoxEl}
-      class="home-search border-brutal-border bg-card-surface flex h-12 w-full max-w-[1100px] shrink-0 items-center gap-3 border-[3px] px-4 md:h-15 md:px-5"
-    >
-      <Search aria-hidden="true" class="text-hister-indigo size-5 shrink-0 md:size-6" />
-      <Input
-        bind:ref={inputEl}
-        bind:value={query}
-        type="search"
-        aria-label="Search your history"
-        placeholder="Search..."
-        class="font-inter text-text-brand placeholder:text-text-brand-muted h-full min-w-0 flex-1 border-0 bg-transparent p-0 text-lg font-medium shadow-none focus-visible:ring-0 md:text-2xl"
-      />
-      <Tooltip.Provider delayDuration={0}>
-        <Tooltip.Root>
-          <Tooltip.Trigger class="flex h-8 w-8 items-center justify-center">
-            <div
-              class="h-2.5 w-2.5 shrink-0 {connected ? 'bg-hister-lime' : 'bg-hister-rose'}"
-            ></div>
-          </Tooltip.Trigger>
-          <Tooltip.Portal>
-            <Tooltip.Content>
-              Server: {connected ? 'Connected' : 'Disconnected'}
-            </Tooltip.Content>
-          </Tooltip.Portal>
-        </Tooltip.Root>
-      </Tooltip.Provider>
+    <div class="relative z-40 w-full max-w-[1100px] shrink-0">
+      <div
+        bind:this={searchBoxEl}
+        class="home-search border-brutal-border bg-card-surface flex h-12 w-full items-center gap-3 border-[3px] px-4 md:h-15 md:px-5"
+      >
+        <Search aria-hidden="true" class="text-hister-indigo size-5 shrink-0 md:size-6" />
+        <Input
+          bind:ref={inputEl}
+          bind:value={query}
+          type="search"
+          aria-label="Search your history"
+          aria-autocomplete="list"
+          aria-controls={querySuggestionsVisible ? querySuggestionListId : undefined}
+          aria-expanded={querySuggestionsVisible}
+          aria-haspopup="listbox"
+          aria-activedescendant={activeQuerySuggestionId}
+          placeholder="Search..."
+          oninput={handleQueryInput}
+          onfocus={handleQueryFocus}
+          onblur={handleQueryBlur}
+          onselect={handleQuerySelection}
+          onclick={handleQuerySelection}
+          onkeydown={handleQueryInputKeydown}
+          class="font-inter text-text-brand placeholder:text-text-brand-muted h-full min-w-0 flex-1 border-0 bg-transparent p-0 text-lg font-medium shadow-none focus-visible:ring-0 md:text-2xl"
+        />
+        <Tooltip.Provider delayDuration={0}>
+          <Tooltip.Root>
+            <Tooltip.Trigger class="flex h-8 w-8 items-center justify-center">
+              <div
+                class="h-2.5 w-2.5 shrink-0 {connected ? 'bg-hister-lime' : 'bg-hister-rose'}"
+              ></div>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content>
+                Server: {connected ? 'Connected' : 'Disconnected'}
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
+        </Tooltip.Provider>
+      </div>
     </div>
 
     <div
@@ -2399,92 +2593,109 @@
     </div>
 
     {#if recentSearches.length > 0}
-      <div
-        bind:this={chipsContainerEl}
-        class="home-recents relative flex max-w-[900px] shrink-0 flex-wrap items-center justify-center gap-2"
+      <section
+        class="home-recents flex w-full max-w-[900px] shrink-0 flex-col gap-2"
+        aria-labelledby="recent-searches-title"
       >
-        {#each recentSearches.slice(0, 8) as search, i}
-          {@const chip = chipColors[i % chipColors.length]}
-          <Button
-            variant="outline"
-            class="border-[2px] {chip.border} {chip.bg} font-inter h-auto cursor-pointer rounded-none px-3 py-1.5 text-sm font-semibold {chip.text} hover:translate-x-px hover:translate-y-px hover:shadow-[2px_2px_0_var(--brutal-shadow)]"
-            onclick={() => clickChip(search)}
-            oncontextmenu={(e) => showChipContextMenu(e, search)}
+        <div class="flex items-center justify-between gap-4">
+          <h2
+            id="recent-searches-title"
+            class="font-inter text-text-brand-secondary flex items-center gap-2 text-sm font-semibold"
           >
-            {search}
+            <History class="text-hister-indigo size-4" />
+            Recent searches
+          </h2>
+          <Button
+            variant="ghost"
+            size="sm"
+            class="font-inter text-text-brand-muted hover:text-hister-rose h-auto cursor-pointer px-2 py-1 text-xs"
+            onclick={deleteAllRecentSearches}
+            title="Clear all recent searches"
+          >
+            Clear all
           </Button>
-        {/each}
-        <Button
-          variant="ghost"
-          size="sm"
-          class="font-inter text-text-brand-muted hover:text-hister-rose h-auto cursor-pointer px-2 py-1 text-xs"
-          onclick={deleteAllRecentSearches}
-          title="Clear all recent searches"
-        >
-          Clear
-        </Button>
-      </div>
+        </div>
+        <div class="flex flex-wrap items-center justify-center gap-2">
+          {#each recentSearches.slice(0, 8) as search, i}
+            {@const chip = chipColors[i % chipColors.length]}
+            <div
+              class="flex max-w-full min-w-0 items-stretch border-[2px] shadow-[2px_2px_0_var(--brutal-shadow)] {chip.border} {chip.bg}"
+            >
+              <button
+                type="button"
+                class="font-inter max-w-80 min-w-0 cursor-pointer truncate px-3 py-1.5 text-left text-sm font-semibold transition-colors hover:bg-black/5 dark:hover:bg-white/5 {chip.text}"
+                title={search}
+                onclick={() => clickChip(search)}
+              >
+                {search}
+              </button>
+              <button
+                type="button"
+                class="hover:bg-hister-rose/10 hover:text-hister-rose flex w-8 shrink-0 cursor-pointer items-center justify-center border-l transition-colors {chip.border} {chip.text}"
+                aria-label="Remove recent search: {search}"
+                title="Remove recent search"
+                onclick={() => deleteRecentSearch(search)}
+              >
+                <X class="size-3.5" />
+              </button>
+            </div>
+          {/each}
+        </div>
+      </section>
     {/if}
 
     <div
       bind:this={statsRowEl}
       class="home-stats flex shrink-0 flex-col items-center gap-3 md:flex-row md:gap-4"
+      aria-live="polite"
+      aria-busy={!statsLoaded}
     >
-      <div class="home-stat-pill text-hister-indigo">
-        <History class="size-3.5 md:size-4" />
-        <span class="font-outfit text-xl font-extrabold">{displayHistoryCount}</span>
-        <span class="font-inter text-text-brand-secondary text-sm">pages</span>
-      </div>
-      {#if !config.public || config.canWrite}
-        <div class="home-stat-pill text-hister-teal">
-          <Shield class="size-3.5 md:size-4" />
-          <span class="font-outfit text-xl font-extrabold">{displayRulesCount}</span>
-          <span class="font-inter text-text-brand-secondary text-sm">rules</span>
-        </div>
-        <div class="home-stat-pill text-hister-coral">
-          <Link2 class="size-3.5 md:size-4" />
-          <span class="font-outfit text-xl font-extrabold">{displayAliasesCount}</span>
-          <span class="font-inter text-text-brand-secondary text-sm">aliases</span>
-        </div>
-      {/if}
-    </div>
-
-    {#if contextMenuSearch}
-      <div
-        class="fixed inset-0 z-40"
-        role="presentation"
-        onclick={() => {
-          contextMenuSearch = null;
-        }}
-        oncontextmenu={(e) => {
-          e.preventDefault();
-          contextMenuSearch = null;
-        }}
-      ></div>
-      <div
-        class="border-brutal-border bg-card-surface fixed z-50 min-w-[160px] border-[3px] py-1 shadow-[4px_4px_0_var(--brutal-shadow)]"
-        style="left: {contextMenuPos.x}px; top: {contextMenuPos.y}px;"
-      >
-        <Button
-          variant="ghost"
-          class="font-inter text-text-brand hover:bg-muted-surface h-auto w-full justify-start gap-2 rounded-none px-3 py-2 text-sm"
-          onclick={() => {
-            clickChip(contextMenuSearch!);
-            contextMenuSearch = null;
+      {#if !statsLoaded}
+        {#each Array(!config.public || config.canWrite ? 3 : 1) as _}
+          <div class="home-stat-pill" aria-hidden="true">
+            <span class="bg-muted-surface size-4"></span>
+            <span class="bg-muted-surface h-5 w-10"></span>
+            <span class="bg-muted-surface h-3 w-12"></span>
+          </div>
+        {/each}
+      {:else if statsAvailable}
+        <a
+          href="{base}/?q=*"
+          class="home-stat-pill home-stat-link text-hister-indigo"
+          aria-label="Browse all indexed pages"
+          onclick={(event) => {
+            event.preventDefault();
+            clickChip('*');
           }}
         >
-          <Search class="size-3.5" /> Search "{contextMenuSearch}"
-        </Button>
-        <Separator class="bg-border-brand-muted mx-2" />
-        <Button
-          variant="ghost"
-          class="font-inter text-hister-rose hover:bg-hister-rose/10 h-auto w-full justify-start gap-2 rounded-none px-3 py-2 text-sm"
-          onclick={() => deleteRecentSearch(contextMenuSearch!)}
-        >
-          <Trash2 class="size-3.5" /> Remove
-        </Button>
-      </div>
-    {/if}
+          <History class="size-3.5 md:size-4" />
+          <span class="font-outfit text-xl font-extrabold">{displayHistoryCount}</span>
+          <span class="font-inter text-text-brand-secondary text-sm">pages</span>
+        </a>
+        {#if !config.public || config.canWrite}
+          <a
+            href="{base}/rules#indexing-rules"
+            class="home-stat-pill home-stat-link text-hister-teal"
+            aria-label="Open indexing rules"
+          >
+            <Shield class="size-3.5 md:size-4" />
+            <span class="font-outfit text-xl font-extrabold">{displayRulesCount}</span>
+            <span class="font-inter text-text-brand-secondary text-sm">rules</span>
+          </a>
+          <a
+            href="{base}/rules#search-aliases"
+            class="home-stat-pill home-stat-link text-hister-coral"
+            aria-label="Open search aliases"
+          >
+            <Link2 class="size-3.5 md:size-4" />
+            <span class="font-outfit text-xl font-extrabold">{displayAliasesCount}</span>
+            <span class="font-inter text-text-brand-secondary text-sm">aliases</span>
+          </a>
+        {/if}
+      {:else}
+        <p class="font-inter text-text-brand-muted text-sm" role="status">Statistics unavailable</p>
+      {/if}
+    </div>
   </div>
 {/if}
 
@@ -2552,6 +2763,20 @@
       var(--card-surface);
     padding: 0.5rem 0.875rem;
     box-shadow: 2px 2px 0 var(--brutal-shadow);
+  }
+
+  .home-stat-link {
+    cursor: pointer;
+    text-decoration: none;
+    transition:
+      box-shadow 150ms ease,
+      transform 150ms ease;
+  }
+
+  .home-stat-link:hover {
+    text-decoration: none;
+    transform: translate(1px, 1px);
+    box-shadow: 1px 1px 0 var(--brutal-shadow);
   }
 
   .home-stat-pill::before {

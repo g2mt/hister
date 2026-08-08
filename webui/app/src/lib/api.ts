@@ -1,9 +1,12 @@
 import { base } from '$app/paths';
+import type { SearchCapabilities } from '$lib/search-schema';
 
 export interface AppConfig {
+  basePath?: string;
   wsUrl: string;
   title: string;
   subtitle: string;
+  colorScheme: 'automatic' | 'dark' | 'light';
   searchUrl: string;
   openResultsOnNewTab: boolean;
   hotkeys: Record<string, string>;
@@ -16,6 +19,10 @@ export interface AppConfig {
   userId?: number;
   oauthOnly?: boolean;
   disablePreviews?: boolean;
+  semanticEnabled?: boolean;
+  semanticWeight?: number;
+  similarityThreshold?: number;
+  search: SearchCapabilities;
 }
 
 export interface ExtractorInfo {
@@ -29,6 +36,9 @@ let _config: AppConfig | null = null;
 let _csrf: string = '';
 
 function apiPath(path: string): string {
+  if (path === '') {
+    return `${base}/api`;
+  }
   return `${base}/api${path.startsWith('/') ? path : `/${path}`}`;
 }
 
@@ -80,9 +90,11 @@ export async function fetchConfig(): Promise<AppConfig> {
 }
 
 export async function login(username: string, password: string): Promise<{ username: string }> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (_csrf) headers['X-CSRF-Token'] = _csrf;
   const res = await fetch(apiPath('/login'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     credentials: 'include',
     body: JSON.stringify({ username, password }),
   });
@@ -94,14 +106,16 @@ export async function login(username: string, password: string): Promise<{ usern
 }
 
 export async function loginWithToken(token: string): Promise<void> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (_csrf) headers['X-CSRF-Token'] = _csrf;
   const res = await fetch(apiPath('/token-login'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     credentials: 'include',
     body: JSON.stringify({ token }),
   });
   if (!res.ok) {
-    throw new Error('Invalid access token');
+    throw new Error('Invalid credentials');
   }
   clearLegacyAccessToken();
   _config = null;

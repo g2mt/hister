@@ -30,7 +30,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const versionBase = "v0.16.0"
+const versionBase = "v0.17.0"
 
 var Version = func() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
@@ -170,8 +170,8 @@ var listenCmd = &cobra.Command{
 				exit(1, `Failed to set server address: `+err.Error())
 			}
 		}
-		if cfg.App.AccessToken != "" && strings.HasPrefix(cfg.BaseURL(""), "http://") {
-			log.Warn().Msg("Using authentication token without https. Token is sent plain-text in network requests.")
+		if (cfg.App.AccessToken != "" || cfg.App.UserHandling) && strings.HasPrefix(cfg.BaseURL(""), "http://") {
+			log.Warn().Msg("Using authentication without https. Credentials and sessions are sent in plain text network requests.")
 		}
 		if len(cfg.Indexer.Directories) > 0 {
 			fileQueue := indexer.NewFileIndexQueue()
@@ -283,9 +283,11 @@ func init() {
 	companionCmd.AddCommand(companionQutebrowserCmd)
 	importCmd.AddCommand(importFileCmd)
 	importCmd.AddCommand(importBrowserCmd)
+	importCmd.AddCommand(importLinkdingCmd)
 	importCmd.AddCommand(importLinkwardenCmd)
 	importCmd.AddCommand(importKarakeepCmd)
 	importCmd.AddCommand(importShaarliCmd)
+	importCmd.AddCommand(importWallabagCmd)
 	importCmd.PersistentFlags().String("label", "", "Label to attach to all imported documents")
 
 	listenCmd.Flags().StringP("address", "a", dcfg.Server.Address, "Listen address")
@@ -295,14 +297,17 @@ func init() {
 	listFilesCmd.Flags().Bool("relative", false, "print paths relative to each configured indexing directory")
 
 	importBrowserCmd.Flags().IntP("min-visit", "m", 1, "only import URLs visited at least this many times")
+	importBrowserCmd.Flags().String("start-date", "", "only import URLs visited on or after this date (YYYY-MM-DD)")
 	addCrawlerBackendFlags(importBrowserCmd)
 
 	crawlQueueCmd.Flags().BoolP("count", "c", false, "only print the number of queued URLs")
 
 	addDocumentImportFlags(importFileCmd)
+	addServiceImportFlags(importLinkdingCmd, "Linkding", linkdingTokenEnv)
 	addServiceImportFlags(importLinkwardenCmd, "Linkwarden", linkwardenTokenEnv)
 	addServiceImportFlags(importKarakeepCmd, "Karakeep", karakeepTokenEnv)
 	addServiceImportFlags(importShaarliCmd, "Shaarli", shaarliSecretEnv)
+	addServiceImportFlags(importWallabagCmd, "wallabag", wallabagTokenEnv)
 	addQutebrowserCompanionFlags(companionQutebrowserCmd)
 
 	exportCmd.Flags().String("start-date", "", "only export documents updated on or after this date (YYYY-MM-DD)")

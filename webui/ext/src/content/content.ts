@@ -5,6 +5,7 @@ let d: PageData;
 const defaultSleepTime = 10 * 1000;
 let sleepTime = defaultSleepTime;
 const sleepIncrementRatio = 2;
+const supportedContentTypes = new Set(['text/html', 'application/xhtml+xml', 'text/plain']);
 // URL that was rejected by the server with a 406 (skip rule match).
 // Cleared when the page navigates to a different URL.
 let skippedUrl: string | null = null;
@@ -37,6 +38,25 @@ if (typeof window.navigation !== 'undefined') {
   window.navigation.addEventListener('navigatesuccess', update);
 }
 
+// Submit the latest page state when the tab is being hidden or closed.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden || !d || !isContextValid()) return;
+  let current;
+  try {
+    current = extractPageData();
+  } catch (_) {
+    return;
+  }
+  if (current.html != d.html || current.url != d.url || current.title != d.title) {
+    d = current;
+    chrome.runtime.sendMessage({ pageData: d }, (resp) => {
+      if (resp?.status_code === 406) {
+        skippedUrl = d.url;
+      }
+    });
+  }
+});
+
 function scheduleUpdate() {
   if (updateTimer !== null) {
     clearTimeout(updateTimer);
@@ -44,8 +64,22 @@ function scheduleUpdate() {
   updateTimer = setTimeout(update, sleepTime);
 }
 
+function normalizeContentType(contentType: string): string {
+  return contentType.split(';', 1)[0].trim().toLowerCase();
+}
+
+function isSupportedContentType(contentType: string): boolean {
+  return supportedContentTypes.has(normalizeContentType(contentType));
+}
+
 function extract(sendResponse, actionType, force) {
   if (!isContextValid()) return;
+  if (!isSupportedContentType(document.contentType)) {
+    if (typeof sendResponse === 'function') {
+      sendResponse({ status: 'unsupported_content_type', content_type: document.contentType });
+    }
+    return;
+  }
   const navEntry = window.performance.getEntries().find((e) => e.entryType === 'navigation') as
     PerformanceNavigationTiming | undefined;
   if (navEntry && navEntry.responseStatus > 299 && !force) {
@@ -92,7 +126,7 @@ function update() {
     console.log('failed to extract page data', e);
     return;
   }
-  if (d2.html != d.html || d2.url != d.url) {
+  if (d2.html != d.html || d2.url != d.url || d2.title != d.title) {
     sleepTime = defaultSleepTime;
     d = d2;
     if (d2.url === skippedUrl) {

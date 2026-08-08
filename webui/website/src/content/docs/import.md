@@ -17,13 +17,17 @@ The `hister import` command collects related import tools under one command. Eve
 | ------------------------------------------- | ------------------------------------------ | ------------- |
 | `hister import file INPUT...`               | Hister exports, archives, and saved pages  | `import`      |
 | `hister import browser [BROWSER] [DB_PATH]` | Browser history databases                  | `browser`     |
+| `hister import linkding INSTANCE_URL`       | A Linkding instance through its HTTP API   | `linkding`    |
 | `hister import linkwarden INSTANCE_URL`     | A Linkwarden instance through its HTTP API | `linkwarden`  |
 | `hister import karakeep INSTANCE_URL`       | A Karakeep instance through its HTTP API   | `karakeep`    |
 | `hister import shaarli INSTANCE_URL`        | A Shaarli instance through its HTTP API    | `shaarli`     |
+| `hister import wallabag INSTANCE_URL`       | A wallabag instance through its HTTP API   | `wallabag`    |
 
 Use the global `--server-url` and `--token` flags when the destination Hister server differs from your configured server or requires authentication.
 
 Use `--label LABEL` with any import source to attach the same label to every imported document. Without this flag, labels stored in imported documents or resumed browser jobs are preserved. The default shown above is applied only when no label was supplied by the user or the imported document.
+
+Hister also limits each batch according to the byte limit advertised by the destination server. Documents are serialized before batching so stored HTML and other large fields are measured accurately. If another HTTP server imposes a smaller limit, Hister splits a rejected batch and retries it automatically. A document that exceeds the limit by itself is reported with its URL, encoded size, and the server limit when known.
 
 ## Importing Files
 
@@ -50,7 +54,7 @@ The following options apply to file imports:
 | ------------------------- | ----------------------------------------------------------- |
 | `--skip-existing`         | Keep documents whose URL already exists in Hister           |
 | `--label LABEL`           | Override stored labels and the default `import` label       |
-| `--batch-size N`          | Submit from 1 through 100 documents per request             |
+| `--batch-size N`          | Submit at most 1 through 100 documents per request          |
 | `--start-date YYYY-MM-DD` | Import documents added on or after the date                 |
 | `--end-date YYYY-MM-DD`   | Import documents added on or before the date                |
 | `--global`                | Import for all users when authenticated as an administrator |
@@ -88,12 +92,21 @@ hister import browser firefox ~/.mozilla/firefox/example.default/places.sqlite
 Firefox stores history in `places.sqlite` inside its profile directory. Chromium based browsers usually store it in a file named `History` inside their profile directory.
 
 Use `--min-visit N` to import only URLs that have at least `N` recorded visits.
+Use `--start-date YYYY-MM-DD` to import only URLs whose most recent recorded
+visit is on or after that date:
+
+```bash
+hister import browser --start-date 2025-01-01
+```
+
+The date filter uses timestamps from the browser database. The indexed
+document timestamp still describes when Hister fetched the page.
 
 Browser history documents receive the `browser` label by default. Use `--label LABEL` to replace it. Resumed browser import jobs reuse their stored label unless this flag is supplied again.
 
 ### Resume and Inspect a Browser Import
 
-Browser imports use persistent crawl jobs named `browser-import-YYYY-MM-DD`. It is safe to interrupt the process and continue it later. Completed URLs remain completed, while pending and failed URLs remain available in the job.
+Browser imports use persistent crawl jobs named `browser-import-YYYY-MM-DD`. It is safe to interrupt the process and continue it later. Completed URLs remain completed, pending URLs resume, and failed URLs remain recorded for inspection.
 
 ```bash
 hister crawl list
@@ -125,7 +138,43 @@ hister import browser \
 
 The `--backend-option`, `--header`, and `--cookie` flags can be repeated. Use `--proxy` with an `http://` or `socks5://` URL. Cookies use `Set-Cookie` syntax and require a `Domain` attribute. See [Website Crawler](crawler) for all crawler settings and backend limitations.
 
-Automated requests can be rejected by bot protection, expired sessions, removed pages, or network failures. Failed URLs remain visible through `hister crawl errors` and can be retried by continuing the job.
+Automated requests can be rejected by bot protection, expired sessions, removed pages, or network failures. Failed URLs remain visible through `hister crawl errors`, but resuming the job does not retry them. Export those URLs into a new URL list job when you want to retry them. See [Retrying Failed URLs](crawler#retrying-failed-urls).
+
+## Importing from Linkding
+
+Copy the API token from the Linkding settings page, then store it in the environment before running the import:
+
+```bash
+export HISTER_IMPORT_LINKDING_TOKEN='your-linkding-token'
+hister import linkding https://linkding.example.com
+```
+
+You can use `--api-token` as a temporary override. The Linkding API token is separate from the global `--token` flag, which authenticates with the destination Hister server. Prefer the environment variable so the Linkding token does not appear in shell history or process listings.
+
+### Incremental Linkding Imports
+
+Every imported Linkding document receives `source: linkding` metadata. Hister searches for `metadata.source:linkding` and reads the newest imported document timestamp before calling Linkding. If a previous import exists, the importer supplies that timestamp through the `modified_since` filter for both active and archived bookmarks. Otherwise, it requests every bookmark.
+
+Deleted Linkding bookmarks are not removed from Hister during an incremental import.
+
+### Linkding Data Mapping
+
+| Linkding value                                     | Hister value            |
+| -------------------------------------------------- | ----------------------- |
+| URL                                                | Normalized document URL |
+| Title                                              | Title                   |
+| Description, notes, and downloaded page content    | Searchable text         |
+| Added date                                         | Added timestamp         |
+| Modification date                                  | Updated timestamp       |
+| Favicon                                            | Document favicon        |
+| Tags, archive state, unread state, sharing, and ID | Document metadata       |
+| Archive snapshot and preview image URLs            | Document metadata       |
+
+Records without a URL are skipped because every Hister document requires a URL. Active and archived pagination and batch submission are automatic.
+
+Linkding stores bookmark metadata rather than complete copies of linked pages. Hister therefore downloads every bookmarked page using the configured crawler backend and combines its extracted content with the stored description and notes.
+
+Consult the [Linkding API documentation](https://linkding.link/api/) when troubleshooting API access.
 
 ## Importing from Linkwarden
 
@@ -226,9 +275,41 @@ Shaarli stores bookmark descriptions rather than complete copies of linked pages
 
 Pagination and batch submission are automatic. Consult the [Shaarli API documentation](https://shaarli.github.io/api-documentation/) and [Shaarli REST API authentication guide](https://shaarli.readthedocs.io/en/master/REST-API.html) when troubleshooting API access.
 
+## Importing from wallabag
+
+Obtain an OAuth access token from wallabag, then store it in the environment before running the import:
+
+```bash
+export HISTER_IMPORT_WALLABAG_TOKEN='your-wallabag-access-token'
+hister import wallabag https://wallabag.example.com
+```
+
+You can use `--api-token` as a temporary override. The wallabag access token is separate from the global `--token` flag, which authenticates with the destination Hister server. Prefer the environment variable so the source token does not appear in shell history or process listings.
+
+### Incremental wallabag Imports
+
+Every imported wallabag document receives `source: wallabag` metadata. Hister searches for `metadata.source:wallabag` and reads the newest imported document timestamp before calling wallabag. If a previous import exists, Hister supplies that timestamp through the wallabag `since` filter and requests entries in ascending update order. Otherwise, it requests every entry.
+
+Deleted wallabag entries are not removed from Hister during an incremental import.
+
+### wallabag Data Mapping
+
+| wallabag value                                            | Hister value            |
+| --------------------------------------------------------- | ----------------------- |
+| URL                                                       | Normalized document URL |
+| Title                                                     | Title                   |
+| Stored article HTML, or downloaded page content           | Searchable text         |
+| Creation date                                             | Added timestamp         |
+| Update date                                               | Updated timestamp       |
+| Tags, authors, status values, reading time, and source ID | Document metadata       |
+
+Hister extracts the article HTML already stored by wallabag and preserves it for offline previews. If the stored content is empty or cannot be extracted, Hister downloads the original URL with the selected crawler backend. Pagination and batch submission are automatic.
+
+Consult the [wallabag OAuth documentation](https://doc.wallabag.org/developer/api/oauth/) and [wallabag API methods](https://doc.wallabag.org/developer/api/methods/) when troubleshooting API access.
+
 ## Service Import Options
 
-The following options apply to Linkwarden, Karakeep, and Shaarli imports:
+The following options apply to Linkding, Linkwarden, Karakeep, Shaarli, and wallabag imports:
 
 Service imports preserve favicon data supplied by the source. When it is absent, Hister tries the favicon URL discovered while extracting the linked page, or the conventional `/favicon.ico` URL when no page icon is available. A favicon download failure does not stop the import.
 

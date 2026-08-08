@@ -71,7 +71,7 @@ func init() {
 			NoAuth:       true,
 			Public:       true,
 			Handler:      serveConfig,
-			Description:  "Return server configuration (base URL, hotkeys, auth mode, CSRF token, etc.)",
+			Description:  "Return server configuration, search capabilities, authentication mode, and CSRF state",
 		},
 		{
 			Name:        "Search",
@@ -85,7 +85,7 @@ func init() {
 					Name:        "q",
 					Type:        "string",
 					Required:    false,
-					Description: "Plain-text search query",
+					Description: "Search query, including filters and directives such as sort:date or sort:-date",
 				},
 				{
 					Name:        "query",
@@ -121,7 +121,7 @@ func init() {
 					Name:        "sort",
 					Type:        "string",
 					Required:    false,
-					Description: "Sort order (e.g. \"date\")",
+					Description: "Legacy sort order. Prefer a sort directive in q. Prefix a value with a minus sign to reverse it",
 				},
 				{
 					Name:        "semantic",
@@ -141,7 +141,7 @@ func init() {
 					Name:        "text",
 					Type:        "string",
 					Required:    false,
-					Description: "Search query string",
+					Description: "Search query string, including filters and sort directives",
 				},
 				{
 					Name:        "date_from",
@@ -171,7 +171,7 @@ func init() {
 					Name:        "sort",
 					Type:        "string",
 					Required:    false,
-					Description: "Sort order (e.g. \"date\")",
+					Description: "Legacy sort order. Prefer a sort directive in text. Prefix a value with a minus sign to reverse it",
 				},
 				{
 					Name:        "limit",
@@ -474,7 +474,7 @@ func init() {
 			CSRFRequired: false,
 			Public:       true,
 			Handler:      serveGetFacets,
-			Description:  "Return facet counts (domains, languages, date histogram) for a query without fetching documents",
+			Description:  "Return all configured facet counts for a query without fetching documents",
 			Args: []*EndpointArg{
 				{
 					Name:        "q",
@@ -498,7 +498,7 @@ func init() {
 					Name:        "size_{name}",
 					Type:        "integer",
 					Required:    false,
-					Description: "Maximum number of terms for the named facet (e.g. size_domains=20, size_languages=10). Defaults to 10.",
+					Description: "Override the configured term limit for a named facet",
 				},
 			},
 		},
@@ -559,6 +559,12 @@ func init() {
 					Description: "Pagination cursor: last history item ID from a previous response (used with opened=true)",
 				},
 				{
+					Name:        "last_updated_at",
+					Type:        "string",
+					Required:    false,
+					Description: "Pagination cursor timestamp from a previous response, used with last_id and opened=true",
+				},
+				{
 					Name:        "last",
 					Type:        "string",
 					Required:    false,
@@ -571,10 +577,62 @@ func init() {
 					Description: "Case insensitive title or URL filter applied before pagination",
 				},
 				{
+					Name:        "date_from",
+					Type:        "integer",
+					Required:    false,
+					Description: "Inclusive Unix timestamp lower bound",
+				},
+				{
+					Name:        "date_to",
+					Type:        "integer",
+					Required:    false,
+					Description: "Exclusive Unix timestamp upper bound",
+				},
+				{
 					Name:        "format",
 					Type:        "string",
 					Required:    false,
 					Description: "Response format; set to \"rss\" to receive an RSS 2.0 feed instead of JSON",
+				},
+			},
+		},
+		{
+			Name:         "History timeline",
+			Path:         "/api/history/timeline",
+			Method:       GET,
+			CSRFRequired: true,
+			Handler:      serveHistoryTimeline,
+			Description:  "Return hierarchical date counts for the history view",
+			Args: []*EndpointArg{
+				{
+					Name:        "opened",
+					Type:        "bool",
+					Required:    false,
+					Description: "When true, count opened result history instead of indexed documents",
+				},
+				{
+					Name:        "filter",
+					Type:        "string",
+					Required:    false,
+					Description: "Case insensitive title or URL filter",
+				},
+				{
+					Name:        "timezone",
+					Type:        "string",
+					Required:    false,
+					Description: "IANA timezone used to construct calendar boundaries",
+				},
+				{
+					Name:        "date_from",
+					Type:        "integer",
+					Required:    false,
+					Description: "Inclusive Unix timestamp lower bound for daily drilldown; requires date_to",
+				},
+				{
+					Name:        "date_to",
+					Type:        "integer",
+					Required:    false,
+					Description: "Exclusive Unix timestamp upper bound for daily drilldown; requires date_from",
 				},
 			},
 		},
@@ -749,10 +807,10 @@ func init() {
 			Description:  "Serve the raw content of a locally indexed file",
 			Args: []*EndpointArg{
 				{
-					Name:        "path",
+					Name:        "id",
 					Type:        "string",
 					Required:    true,
-					Description: "Absolute path to the file",
+					Description: "Indexed document ID in user_id:url form, or the URL for a shared document",
 				},
 			},
 		},
@@ -762,7 +820,7 @@ func init() {
 			Method:       POST,
 			CSRFRequired: true,
 			Handler:      serveBatch,
-			Description:  "Execute up to 100 add/delete/get operations in a single request (5 MB body limit)",
+			Description:  "Execute up to 100 add/delete/get operations in a single request (body limit configured by server.max_batch_body_size, default 40 MiB)",
 			JSONSchema: []*JSONSchemaField{
 				{
 					Name:        "ops",
@@ -950,8 +1008,8 @@ func init() {
 						{
 							Name:        "name",
 							Type:        "string",
-							Required:    true,
-							Description: "Tool name; must be \"search\" for tools/call",
+							Required:    false,
+							Description: "Tool name required by tools/call: search, get_preview, or get_history",
 						},
 						{
 							Name:        "arguments",
@@ -962,14 +1020,68 @@ func init() {
 								{
 									Name:        "query",
 									Type:        "string",
-									Required:    true,
-									Description: "Search query string",
+									Required:    false,
+									Description: "Search query string required by the search tool",
 								},
 								{
 									Name:        "limit",
 									Type:        "int",
 									Required:    false,
-									Description: "Maximum number of results (default 10)",
+									Description: "Maximum search or history results",
+								},
+								{
+									Name:        "date_from",
+									Type:        "string",
+									Required:    false,
+									Description: "Search lower date bound in YYYY-MM-DD format",
+								},
+								{
+									Name:        "date_to",
+									Type:        "string",
+									Required:    false,
+									Description: "Search upper date bound in YYYY-MM-DD format",
+								},
+								{
+									Name:        "semantic",
+									Type:        "bool",
+									Required:    false,
+									Description: "Enable semantic search when configured",
+								},
+								{
+									Name:        "fields",
+									Type:        "string[]",
+									Required:    false,
+									Description: "Extra document fields returned by search",
+								},
+								{
+									Name:        "url",
+									Type:        "string",
+									Required:    false,
+									Description: "Exact document URL required by get_preview",
+								},
+								{
+									Name:        "extractor",
+									Type:        "string",
+									Required:    false,
+									Description: "Optional preview extractor name",
+								},
+								{
+									Name:        "mode",
+									Type:        "string",
+									Required:    false,
+									Description: "History mode: indexed or opened",
+								},
+								{
+									Name:        "page_key",
+									Type:        "string",
+									Required:    false,
+									Description: "Pagination cursor for indexed history",
+								},
+								{
+									Name:        "last_id",
+									Type:        "int",
+									Required:    false,
+									Description: "Pagination cursor for opened history",
 								},
 							},
 						},

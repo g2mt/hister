@@ -7,10 +7,11 @@
   import SettingsInput from './SettingsInput.svelte';
   import { Plus, Trash2, Sun, Moon } from '@lucide/svelte';
   import { ModeWatcher, toggleMode, mode } from 'mode-watcher';
+  import { fetchAPI, syncServerCookies } from '../modules/network';
+  import { DEFAULT_SERVER_URL } from '../modules/settings';
 
-  const defaultURL = 'http://127.0.0.1:4433/';
-
-  let url = $state(defaultURL);
+  let url = $state(DEFAULT_SERVER_URL);
+  let accessToken = $state('');
   let customHeaders: { name: string; value: string }[] = $state([]);
   let submitPublicDocuments = $state(false);
   let profileUserID = $state(0);
@@ -24,32 +25,23 @@
   chrome.storage.local.get(
     [
       'histerURL',
+      'histerToken',
       'histerCustomHeaders',
-      'histerCookies',
       'submitPublicDocuments',
       'histerProfileUserID',
     ],
     (data) => {
       if (!data['histerURL']) {
-        chrome.storage.local.set({ histerURL: defaultURL });
+        chrome.storage.local.set({ histerURL: DEFAULT_SERVER_URL });
       }
-      url = data['histerURL'] || defaultURL;
+      url = data['histerURL'] || DEFAULT_SERVER_URL;
+      accessToken = data['histerToken'] || '';
       customHeaders = Array.isArray(data['histerCustomHeaders']) ? data['histerCustomHeaders'] : [];
       submitPublicDocuments = data['submitPublicDocuments'] === true;
       profileUserID = Number(data['histerProfileUserID'] ?? 0);
-      refreshProfileUserID(url, data['histerCookies'] || '', customHeaders);
+      refreshProfileUserID(url, customHeaders);
     },
   );
-
-  function headersFromCustomHeaders(headersList = customHeaders): HeadersInit {
-    const headers: HeadersInit = {};
-    for (const h of headersList) {
-      if (h.name) {
-        headers[h.name] = h.value || '';
-      }
-    }
-    return headers;
-  }
 
   function setProfileUserID(userID: number) {
     profileUserID = userID;
@@ -60,35 +52,35 @@
     }
   }
 
-  function refreshProfileUserID(serverURL: string, cookieStr = '', headersList = customHeaders) {
+  async function refreshProfileUserID(
+    serverURL: string,
+    headersList = customHeaders,
+    token = accessToken,
+  ): Promise<boolean> {
     let profileURL = serverURL;
     if (!profileURL.endsWith('/')) {
       profileURL += '/';
     }
-    const headers = headersFromCustomHeaders(headersList);
-    if (cookieStr) {
-      headers['Cookie'] = cookieStr;
-    }
-    fetch(profileURL + 'api/profile', { headers, credentials: 'include' })
-      .then(async (response) => {
-        if (response.status === 403) {
-          setProfileUserID(0);
-          return;
-        }
-        if (!response.ok) {
-          setProfileUserID(0);
-          return;
-        }
-        try {
-          const profile = await response.json();
-          setProfileUserID(Number(profile?.user_id ?? 0));
-        } catch (_) {
-          setProfileUserID(0);
-        }
-      })
-      .catch(() => {
-        setProfileUserID(0);
+    try {
+      const response = await fetchAPI(profileURL + 'api/profile', {
+        customHeaders: headersList,
+        accessToken: token,
       });
+      if (!response.ok) {
+        setProfileUserID(0);
+        return false;
+      }
+      let userID = 0;
+      try {
+        const profile = await response.json();
+        userID = Number(profile?.user_id ?? 0);
+      } catch (_) {}
+      setProfileUserID(userID);
+      return true;
+    } catch (_) {
+      setProfileUserID(0);
+      return false;
+    }
   }
 
   function addHeader() {
@@ -99,23 +91,26 @@
     customHeaders.splice(index, 1);
   }
 
-  function save(e: Event) {
+  async function save(e: Event) {
     e.preventDefault();
     const headersToSave = customHeaders.filter((h) => h.name.trim() !== '');
-    chrome.storage.local
-      .set({
-        histerURL: url,
-        histerCustomHeaders: $state.snapshot(headersToSave),
-        submitPublicDocuments: isAuthenticated(profileUserID) && submitPublicDocuments,
-      })
-      .then(() => {
-        customHeaders = headersToSave;
-        message = 'Settings saved';
-        messageType = 'success';
-        chrome.storage.local.get(['histerCookies'], (data) => {
-          refreshProfileUserID(url, data['histerCookies'] || '', headersToSave);
-        });
-      });
+    const tokenToSave = accessToken.trim();
+    await chrome.storage.local.set({
+      histerURL: url,
+      histerToken: tokenToSave,
+      histerCustomHeaders: $state.snapshot(headersToSave),
+      submitPublicDocuments: isAuthenticated(profileUserID) && submitPublicDocuments,
+    });
+    customHeaders = headersToSave;
+    accessToken = tokenToSave;
+    const authenticated = await refreshProfileUserID(url, headersToSave, tokenToSave);
+    if (tokenToSave && !authenticated) {
+      message = 'Settings saved, but the access token was rejected.';
+      messageType = 'error';
+    } else {
+      message = 'Settings saved';
+      messageType = 'success';
+    }
   }
 
   function toggleSubmitPublicDocuments() {
@@ -124,25 +119,30 @@
     });
   }
 
-  function authenticate() {
+  async function authenticate() {
     let authURL = url;
     if (!authURL.endsWith('/')) {
       authURL += '/';
     }
-    chrome.cookies.getAll({ url: authURL }, (cookies) => {
-      if (!cookies.length) {
+    try {
+      const cookieHeader = await syncServerCookies(authURL);
+      if (!cookieHeader) {
         message =
           'No cookies found for server URL. Make sure you are logged in to the Hister web app.';
         messageType = 'error';
         return;
       }
-      const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-      chrome.storage.local.set({ histerCookies: cookieStr }).then(() => {
-        refreshProfileUserID(url, cookieStr);
+      if (await refreshProfileUserID(url)) {
         message = 'Authentication successful';
         messageType = 'success';
-      });
-    });
+      } else {
+        message = 'Authentication failed. Make sure you are logged in to the Hister web app.';
+        messageType = 'error';
+      }
+    } catch (error) {
+      message = (error as Error).message ?? 'Failed to read browser cookies.';
+      messageType = 'error';
+    }
   }
 </script>
 
@@ -200,6 +200,14 @@
             bind:value={url}
             placeholder="Server URL..."
             description="The full URL of your Hister server, including the port number."
+          />
+
+          <SettingsInput
+            label="Access Token"
+            bind:value={accessToken}
+            type="password"
+            placeholder="Optional access token..."
+            description="Authenticate with a global or personal access token. Leave blank to use browser cookies."
           />
 
           <!-- Custom Headers -->
@@ -280,7 +288,7 @@
             onclick={authenticate}
             class="border-brutal-border font-outfit hover:border-hister-indigo h-12 w-full border-[3px] text-base font-bold tracking-wide transition-all"
           >
-            Authenticate Extension
+            Authenticate with Browser Session
           </Button>
         </form>
       </Card.Content>

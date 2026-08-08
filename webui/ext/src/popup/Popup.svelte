@@ -10,10 +10,11 @@
   import { Settings, Sun, Moon, Save, Info, Check } from '@lucide/svelte';
   import { slide } from 'svelte/transition';
   import { ModeWatcher, toggleMode, mode } from 'mode-watcher';
+  import { fetchAPI, syncServerCookies } from '../modules/network';
+  import { DEFAULT_SERVER_URL } from '../modules/settings';
 
-  const defaultURL = 'http://127.0.0.1:4433/';
-
-  let url = $state(defaultURL);
+  let url = $state(DEFAULT_SERVER_URL);
+  let accessToken = $state('');
   let customHeaders: { name: string; value: string }[] = $state([]);
   let indexingEnabled = $state(true);
   let indexOnlyOnce = $state(false);
@@ -61,59 +62,41 @@
     }
   }
 
-  function checkAuth(serverURL: string, cookieStr?: string): Promise<boolean> {
+  function checkAuth(serverURL: string, token = accessToken): Promise<boolean> {
     let authURL = serverURL;
     if (!authURL.endsWith('/')) {
       authURL += '/';
     }
-    const doCheck = (cookies: string) => {
-      const headers: HeadersInit = { 'Content-Type': 'application/json' };
-      if (cookies) {
-        headers['Cookie'] = cookies;
-      }
-      return fetch(authURL + 'api/profile', { headers, credentials: 'include' })
-        .then(async (r) => {
-          if (r.status === 403) {
-            authCheckPassed = false;
-            setProfileUserID(0);
-            return false;
-          }
-          if (!r.ok) {
-            authCheckPassed = false;
-            setProfileUserID(0);
-            return false;
-          }
-          try {
-            const profile = await r.json();
-            setProfileUserID(Number(profile?.user_id ?? 0));
-          } catch (_) {
-            setProfileUserID(0);
-          }
-          authCheckPassed = true;
-          return authCheckPassed;
-        })
-        .catch(() => {
+    return fetchAPI(authURL + 'api/profile', { customHeaders, accessToken: token })
+      .then(async (r) => {
+        if (!r.ok) {
+          authCheckPassed = false;
           setProfileUserID(0);
           return false;
-        });
-    };
-    if (cookieStr !== undefined) {
-      return doCheck(cookieStr);
-    }
-    return new Promise((resolve) => {
-      chrome.storage.local.get(['histerCookies'], (data) => {
-        resolve(doCheck(data['histerCookies'] || ''));
+        }
+        try {
+          const profile = await r.json();
+          setProfileUserID(Number(profile?.user_id ?? 0));
+        } catch (_) {
+          setProfileUserID(0);
+        }
+        authCheckPassed = true;
+        return authCheckPassed;
+      })
+      .catch(() => {
+        authCheckPassed = false;
+        setProfileUserID(0);
+        return false;
       });
-    });
   }
 
   chrome.storage.local.get(
     [
       'histerURL',
+      'histerToken',
       'histerCustomHeaders',
       'indexingEnabled',
       'indexOnlyOnce',
-      'histerCookies',
       'histerLabel',
       'showIndexedBadge',
       'submitPublicDocuments',
@@ -121,9 +104,10 @@
     ],
     (data) => {
       if (!data['histerURL']) {
-        chrome.storage.local.set({ histerURL: defaultURL });
+        chrome.storage.local.set({ histerURL: DEFAULT_SERVER_URL });
       }
-      url = data['histerURL'] || defaultURL;
+      url = data['histerURL'] || DEFAULT_SERVER_URL;
+      accessToken = data['histerToken'] || '';
       customHeaders = Array.isArray(data['histerCustomHeaders']) ? data['histerCustomHeaders'] : [];
       indexingEnabled = data['indexingEnabled'] !== false;
       indexOnlyOnce = data['indexOnlyOnce'] === true;
@@ -132,7 +116,7 @@
       profileUserID = Number(data['histerProfileUserID'] ?? 0);
       pageLabel = data['histerLabel'] || '';
 
-      checkAuth(url, data['histerCookies'] || '');
+      checkAuth(url);
 
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (!tabs?.length) return;
@@ -192,7 +176,7 @@
     } catch (_) {}
   }
 
-  function save(e: Event) {
+  async function save(e: Event) {
     e.preventDefault();
 
     let verifyURL = url;
@@ -200,45 +184,44 @@
       verifyURL += '/';
     }
 
-    const headers: HeadersInit = {};
-    for (const h of customHeaders) {
-      if (h.name) {
-        headers[h.name] = h.value || '';
-      }
-    }
-
-    fetch(verifyURL + 'api/config', { headers, credentials: 'include' })
-      .then((response) => {
-        if (response.status !== 200) {
-          setErrorMessage(`Server returned status ${response.status}`);
-          return;
-        }
-        return response
-          .json()
-          .then(() => {
-            chrome.storage.local
-              .set({
-                histerURL: url,
-                histerCustomHeaders: $state.snapshot(customHeaders),
-                submitPublicDocuments: isAuthenticated(profileUserID) && submitPublicDocuments,
-              })
-              .then(() => {
-                setSuccessMessage('Settings saved');
-
-                chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-                  if (tabs?.length) {
-                    chrome.action.setBadgeText({ text: '', tabId: tabs[0].id! });
-                  }
-                });
-              });
-          })
-          .catch(() => {
-            setErrorMessage('Server response is not valid JSON - probably invalid server URL.');
-          });
-      })
-      .catch((err) => {
-        setErrorMessage(err.message);
+    const tokenToSave = accessToken.trim();
+    try {
+      const response = await fetchAPI(verifyURL + 'api/config', {
+        customHeaders,
+        accessToken: tokenToSave,
       });
+      if (response.status !== 200) {
+        setErrorMessage(`Server returned status ${response.status}`);
+        return;
+      }
+      try {
+        await response.json();
+      } catch (_) {
+        setErrorMessage('Server response is not valid JSON - probably invalid server URL.');
+        return;
+      }
+      await chrome.storage.local.set({
+        histerURL: url,
+        histerToken: tokenToSave,
+        histerCustomHeaders: $state.snapshot(customHeaders),
+        submitPublicDocuments: isAuthenticated(profileUserID) && submitPublicDocuments,
+      });
+      accessToken = tokenToSave;
+      const authenticated = await checkAuth(url, tokenToSave);
+      if (tokenToSave && !authenticated) {
+        setErrorMessage('Settings saved, but the access token was rejected.');
+      } else {
+        setSuccessMessage('Settings saved');
+      }
+
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs?.length) {
+          chrome.action.setBadgeText({ text: '', tabId: tabs[0].id! });
+        }
+      });
+    } catch (error) {
+      setErrorMessage((error as Error).message);
+    }
   }
 
   function toggleIndexing() {
@@ -260,31 +243,29 @@
     });
   }
 
-  function authenticate() {
+  async function authenticate() {
     let authURL = url;
     if (!authURL.endsWith('/')) {
       authURL += '/';
     }
-    chrome.cookies.getAll({ url: authURL }, (cookies) => {
-      if (!cookies.length) {
+    try {
+      const cookieHeader = await syncServerCookies(authURL);
+      if (!cookieHeader) {
         setErrorMessage(
           'No cookies found for server URL. Make sure you are logged in to the Hister web app.',
         );
         return;
       }
-      const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-      chrome.storage.local.set({ histerCookies: cookieStr }).then(() => {
-        checkAuth(url, cookieStr).then((ok) => {
-          if (ok) {
-            setSuccessMessage('Authentication successful');
-          } else {
-            setErrorMessage(
-              'Authentication failed. Make sure you are logged in to the Hister web app.',
-            );
-          }
-        });
-      });
-    });
+      if (await checkAuth(url)) {
+        setSuccessMessage('Authentication successful');
+      } else {
+        setErrorMessage(
+          'Authentication failed. Make sure you are logged in to the Hister web app.',
+        );
+      }
+    } catch (error) {
+      setErrorMessage((error as Error).message ?? 'Failed to read browser cookies.');
+    }
   }
 
   function reindex() {
@@ -315,21 +296,11 @@
   }
 
   async function applyLabel() {
-    const cookieStr = await new Promise<string>((resolve) => {
-      chrome.storage.local.get(['histerCookies'], (data) => resolve(data['histerCookies'] ?? ''));
-    });
     const serverURL = url.endsWith('/') ? url.slice(0, -1) : url;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (cookieStr) headers['Cookie'] = cookieStr;
-    for (const h of customHeaders) {
-      if (h.name) headers[h.name] = h.value ?? '';
-    }
     try {
-      const res = await fetch(`${serverURL}/api/label`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ url: tabURL, label: pageLabel }),
-        credentials: 'include',
+      const res = await fetchAPI(`${serverURL}/api/label`, {
+        body: { url: tabURL, label: pageLabel },
+        customHeaders,
       });
       if (res.ok) {
         pageLabel = '';
@@ -383,6 +354,14 @@
       <Card.Content class="space-y-4 p-5">
         <form onsubmit={save} class="space-y-4">
           <SettingsInput label="Server URL" bind:value={url} placeholder="Server URL..." />
+
+          <SettingsInput
+            label="Access Token"
+            bind:value={accessToken}
+            type="password"
+            placeholder="Optional access token..."
+            description="Authenticate with a global or personal access token. Leave blank to use browser cookies."
+          />
 
           <Button
             type="submit"
@@ -568,7 +547,7 @@
           onclick={authenticate}
           class="border-brutal-border font-outfit hover:border-hister-indigo h-9 w-full border-[3px] text-sm font-bold tracking-wide transition-all hover:shadow-[3px_3px_0_var(--brutal-shadow)]"
         >
-          Authenticate Extension
+          Authenticate with Browser Session
         </Button>
       </div>
     {/if}

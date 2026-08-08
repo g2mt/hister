@@ -456,6 +456,7 @@ function cjsMsgHandler(request, sender, sendResponse) {
       'histerToken',
       'indexingEnabled',
       'indexOnlyOnce',
+      'alwaysReindexSites',
       'histerCustomHeaders',
       'showIndexedBadge',
       'submitPublicDocuments',
@@ -465,6 +466,12 @@ function cjsMsgHandler(request, sender, sendResponse) {
       const indexingEnabled = data['indexingEnabled'] !== false;
       const indexOnlyOnce = data['indexOnlyOnce'] === true;
       const showIndexedBadge = data['showIndexedBadge'] === true;
+      const alwaysReindexSites = new Set(
+        String(data['alwaysReindexSites'] ?? '')
+          .split(/\r?\n/)
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean),
+      );
       const customHeaders = getCustomHeaders(data);
 
       if (request.action === 'getTabState') {
@@ -528,19 +535,28 @@ function cjsMsgHandler(request, sender, sendResponse) {
 
           const customHeaders = getDocumentSubmissionHeaders(data);
           if (indexOnlyOnce && request.action !== 'reindex') {
+            let skipReindexCheck = false;
             try {
-              const indexed = await isUrlPreviouslyIndexed(request.pageData.url, u, customHeaders);
-              if (indexed) {
-                setNormalIcon(sender.tab.id);
-                if (showIndexedBadge) {
-                  setPreviouslyIndexedBadge(sender.tab.id);
-                } else {
-                  clearBadge(sender.tab.id);
-                }
-                return;
-              }
+              const pageHost = new URL(request.pageData.url).hostname.toLowerCase();
+              skipReindexCheck = alwaysReindexSites.has(pageHost);
             } catch {
-              // isUrlPreviouslyIndexed must have failed, try adding the page manually
+              skipReindexCheck = false;
+            }
+            if (!skipReindexCheck) {
+              try {
+                const indexed = await isUrlPreviouslyIndexed(request.pageData.url, u, customHeaders);
+                if (indexed) {
+                  setNormalIcon(sender.tab.id);
+                  if (showIndexedBadge) {
+                    setPreviouslyIndexedBadge(sender.tab.id);
+                  } else {
+                    clearBadge(sender.tab.id);
+                  }
+                  return;
+                }
+              } catch {
+                // isUrlPreviouslyIndexed must have failed, try adding the page manually
+              }
             }
           }
 

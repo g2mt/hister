@@ -359,7 +359,7 @@
         chrome.tabs.create({ url });
       }}
       class="font-outfit cursor-pointer text-lg font-black tracking-widest text-white uppercase hover:underline"
-      >Hister</a
+      >Hister (fork)</a
     >
     <div class="flex items-center gap-2">
       <button

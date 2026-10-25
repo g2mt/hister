@@ -298,6 +298,26 @@ function getDocumentSubmissionHeaders(data): CustomHeader[] {
   return customHeaders;
 }
 
+async function shouldSkipPreviouslyIndexedURL(url: string, data): Promise<boolean> {
+  if (data['indexOnlyOnce'] !== true) return false;
+
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch (_) {
+    return false;
+  }
+  const alwaysReindexSites = new Set(
+    String(data['alwaysReindexSites'] ?? '')
+      .split(/\r?\n/)
+      .map((site) => site.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (alwaysReindexSites.has(hostname)) return false;
+
+  return isUrlPreviouslyIndexed(url, data['histerURL'] || '', getDocumentSubmissionHeaders(data));
+}
+
 async function saveSkipRule(
   baseURL: string,
   customHeaders: CustomHeader[],
@@ -543,6 +563,16 @@ async function indexPDFTab(
 
   const u = serverURL.endsWith('/') ? serverURL : serverURL + '/';
 
+  if (!ignoreSkipRules && (await shouldSkipPreviouslyIndexedURL(tab.url!, data))) {
+    setNormalIcon(tabId);
+    if (showIndexedBadge) {
+      setPreviouslyIndexedBadge(tabId);
+    } else {
+      clearBadge(tabId);
+    }
+    return { status: 'already_indexed', status_code: 200 };
+  }
+
   try {
     const response = await fetch(tab.url!, { credentials: 'include' });
     if (!response.ok) {
@@ -765,6 +795,10 @@ async function submitPageData(baseURL: string, request, sender, data): Promise<I
       if (tabId !== undefined) await setGreyIcon(tabId);
       return { status: 'ok', status_code: 406 };
     }
+    if (await shouldSkipPreviouslyIndexedURL(request.pageData.url, data)) {
+      applySubmissionStatus(201, sender, data['showIndexedBadge'] === true);
+      return { status: 'already_indexed', status_code: 200 };
+    }
   }
   const labelData = await chrome.storage.local.get(['histerLabel']);
   const pageData = { ...request.pageData };
@@ -794,6 +828,8 @@ function cjsMsgHandler(request, sender, sendResponse) {
       'histerURL',
       'histerToken',
       'indexingEnabled',
+      'indexOnlyOnce',
+      'alwaysReindexSites',
       'histerCustomHeaders',
       'showIndexedBadge',
       'submitPublicDocuments',

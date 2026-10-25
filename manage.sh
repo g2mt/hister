@@ -1,5 +1,6 @@
 #!/bin/sh
 
+export LC_ALL=C
 BASE_DIR="$(dirname -- "`readlink -f -- "$0"`")"
 ACTION="$1"
 [ -z "$ACTION" ] || shift

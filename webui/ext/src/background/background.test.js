@@ -22,6 +22,9 @@ function browser({
   rules = {},
   contentScript = true,
   indexingEnabled = true,
+  indexOnlyOnce = false,
+  alwaysReindexSites = '',
+  documentAlreadyIndexed = true,
   sourceURL = 'https://example.com/visited?tracking=true',
   sessionData = {},
   sessionAvailable = true,
@@ -44,6 +47,8 @@ function browser({
     histerURL: 'https://hister.example/',
     showIndexedBadge: true,
     indexingEnabled,
+    indexOnlyOnce,
+    alwaysReindexSites,
   };
   const event = { addListener() {} };
   const action = (_, callback) => callback?.();
@@ -136,7 +141,7 @@ function browser({
       }
       if (parsed.pathname === '/api/document') {
         lookups.push(parsed.searchParams.get('url'));
-        return new Response('', { status: 200 });
+        return new Response('', { status: documentAlreadyIndexed ? 200 : 404 });
       }
       if (parsed.hostname === 'example.com') return new Response('%PDF-test');
       throw new Error(`Unexpected fetch: ${url}`);
@@ -227,6 +232,49 @@ test('visited URL rules continue to ignore fragments', async () => {
     rules: { allow: ['/visited$', '/clean$'] },
   });
   assert.equal((await b.submit()).status_code, 201);
+});
+
+test('automatic submissions skip URLs that are already indexed when index-only-once is enabled', async () => {
+  const b = browser({ indexOnlyOnce: true });
+  const response = await b.submit();
+  assert.equal(response.status, 'already_indexed');
+  assert.equal(response.status_code, 200);
+  assert.deepEqual(b.lookups, [b.canonicalURL]);
+  assert.equal(b.documents.length, 0);
+});
+
+test('index-only-once submits new URLs and manual reindex bypasses the duplicate check', async () => {
+  const fresh = browser({ indexOnlyOnce: true, documentAlreadyIndexed: false });
+  assert.equal((await fresh.submit()).status_code, 201);
+  assert.deepEqual(fresh.lookups, [fresh.canonicalURL]);
+  assert.equal(fresh.documents.length, 1);
+
+  const manual = browser({ indexOnlyOnce: true });
+  assert.equal((await manual.submit(true)).status_code, 201);
+  assert.deepEqual(manual.lookups, []);
+  assert.equal(manual.documents.length, 1);
+});
+
+test('always-reindex site hosts bypass the index-only-once lookup', async () => {
+  const b = browser({ indexOnlyOnce: true, alwaysReindexSites: ' EXAMPLE.com ' });
+  assert.equal((await b.submit()).status_code, 201);
+  assert.deepEqual(b.lookups, []);
+  assert.equal(b.documents.length, 1);
+});
+
+test('automatic PDF indexing skips existing documents, while manual PDF indexing forces reindex', async () => {
+  const url = 'https://example.com/paper';
+  const automatic = browser({ indexOnlyOnce: true, sourceURL: url });
+  automatic.respond(200, url, 1, 'application/pdf');
+  await automatic.advance(5000);
+  assert.deepEqual(automatic.lookups, [url]);
+  assert.equal(automatic.pdfDocuments.length, 0);
+
+  const manual = browser({ indexOnlyOnce: true, sourceURL: url });
+  manual.respond(200, url, 1, 'application/pdf');
+  assert.equal((await manual.indexCurrent()).status_code, 201);
+  assert.deepEqual(manual.lookups, []);
+  assert.equal(manual.pdfDocuments.length, 1);
 });
 
 test('indexed badges look up the canonical URL even with automatic indexing disabled', async () => {

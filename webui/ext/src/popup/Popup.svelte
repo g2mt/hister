@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button } from '@hister/components/ui/button';
   import { Input } from '@hister/components/ui/input';
+  import { Textarea } from '@hister/components/ui/textarea';
   import { Label } from '@hister/components/ui/label';
   import { Switch } from '@hister/components/ui/switch';
   import * as Card from '@hister/components/ui/card';
@@ -18,6 +19,8 @@
   let accessToken = $state('');
   let customHeaders: { name: string; value: string }[] = $state([]);
   let indexingEnabled = $state(true);
+  let indexOnlyOnce = $state(false);
+  let alwaysReindexSites = $state('');
   let showIndexedBadge = $state(false);
   let submitPublicDocuments = $state(false);
   let profileUserID = $state(0);
@@ -97,6 +100,8 @@
       'histerToken',
       'histerCustomHeaders',
       'indexingEnabled',
+      'indexOnlyOnce',
+      'alwaysReindexSites',
       'histerLabel',
       'showIndexedBadge',
       'submitPublicDocuments',
@@ -110,6 +115,8 @@
       accessToken = data['histerToken'] || '';
       customHeaders = Array.isArray(data['histerCustomHeaders']) ? data['histerCustomHeaders'] : [];
       indexingEnabled = data['indexingEnabled'] !== false;
+      indexOnlyOnce = data['indexOnlyOnce'] === true;
+      alwaysReindexSites = data['alwaysReindexSites'] || '';
       showIndexedBadge = data['showIndexedBadge'] === true;
       submitPublicDocuments = data['submitPublicDocuments'] === true;
       profileUserID = Number(data['histerProfileUserID'] ?? 0);
@@ -234,6 +241,31 @@
     chrome.storage.local.set({ showIndexedBadge: showIndexedBadge });
   }
 
+  function toggleIndexOnlyOnce() {
+    chrome.storage.local.set({ indexOnlyOnce });
+  }
+
+  function saveAlwaysReindexSites() {
+    chrome.storage.local.set({ alwaysReindexSites });
+  }
+
+  function addCurrentSite() {
+    try {
+      const host = new URL(tabURL).hostname.toLowerCase();
+      if (!host) throw new Error('Invalid page URL');
+      const hosts = alwaysReindexSites
+        .split(/\r?\n/)
+        .map((site) => site.trim().toLowerCase())
+        .filter(Boolean);
+      if (!hosts.includes(host)) hosts.push(host);
+      alwaysReindexSites = hosts.join('\n');
+      saveAlwaysReindexSites();
+      setSuccessMessage('Site added');
+    } catch {
+      setErrorMessage('No valid page URL');
+    }
+  }
+
   function toggleSubmitPublicDocuments() {
     chrome.storage.local.set({
       submitPublicDocuments: isAuthenticated(profileUserID) && submitPublicDocuments,
@@ -330,7 +362,7 @@
         chrome.tabs.create({ url });
       }}
       class="font-outfit cursor-pointer text-lg font-black tracking-widest text-white uppercase hover:underline"
-      >Hister</a
+      >Hister (fork)</a
     >
     <div class="flex items-center gap-2">
       <button
@@ -425,6 +457,50 @@
           Automatic indexing
         </Label>
         <Switch id="indexing" bind:checked={indexingEnabled} onCheckedChange={toggleIndexing} />
+      </div>
+    </div>
+
+    <div class="border-brutal-border space-y-4 border-b-[3px] px-5 py-4">
+      <div class="flex items-center justify-between">
+        <Label
+          for="index-only-once"
+          class="font-outfit text-text-brand cursor-pointer text-sm font-bold"
+        >
+          Index only once
+        </Label>
+        <Switch
+          id="index-only-once"
+          bind:checked={indexOnlyOnce}
+          onCheckedChange={toggleIndexOnlyOnce}
+        />
+      </div>
+
+      <div class="space-y-1">
+        <Label
+          for="always-reindex-sites"
+          class="font-outfit text-text-brand cursor-pointer text-sm font-bold"
+        >
+          Always reindex these sites
+        </Label>
+        <p class="font-outfit text-text-brand-muted text-xs">
+          One host per line. These sites are reindexed automatically even when "Index only once" is
+          enabled.
+        </p>
+        <Textarea
+          id="always-reindex-sites"
+          bind:value={alwaysReindexSites}
+          onchange={saveAlwaysReindexSites}
+          placeholder={'www.google.com\ngithub.com'}
+          rows={3}
+          class="bg-page-bg border-hister-indigo font-fira text-text-brand placeholder:text-text-brand-muted focus-visible:border-hister-coral min-h-16 w-full resize-y border-[3px] px-3 py-2 text-sm shadow-none transition-colors focus-visible:ring-0"
+        />
+        <Button
+          variant="outline"
+          onclick={addCurrentSite}
+          class="border-brutal-border font-outfit hover:border-hister-indigo h-8 w-full border-[3px] text-xs font-bold tracking-wide transition-all hover:shadow-[3px_3px_0_var(--brutal-shadow)]"
+        >
+          Add this site
+        </Button>
       </div>
     </div>
 
